@@ -3,6 +3,7 @@ const { z } = require('zod');
 const { query, withTransaction } = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const cache = require('../../config/redis');
+const { getAppSettings, validateBidsPayload } = require('../../services/appSettings');
 
 const router = express.Router();
 
@@ -53,7 +54,85 @@ router.post('/', requireAuth, requireRole('player'), async (req, res, next) => {
       })
       .parse(req.body);
 
+    const appSettings = await getAppSettings();
+    const bidCheck = validateBidsPayload(appSettings, body.bids);
+    if (!bidCheck.ok) {
+      return res.status(bidCheck.code === 'BIDS_DISABLED' || bidCheck.code === 'GAMES_DISABLED' ? 403 : 400).json({
+        ok: false,
+        error: bidCheck.code,
+        message: bidCheck.message,
+      });
+    }
+
     const total = body.bids.reduce((s, b) => s + b.points, 0);
+
+    // Starline: open-only + reject after slot close / inactive
+    if (body.marketId.startsWith('starline-')) {
+      for (const b of body.bids) {
+        if (b.session && b.session !== 'open') {
+          return res.status(400).json({
+            ok: false,
+            error: 'STARLINE_OPEN_ONLY',
+            message: 'Starline accepts Open session only',
+          });
+        }
+        b.session = 'open';
+      }
+      const slots = await query(
+        `SELECT close_minutes AS closeMinutes, is_active AS isActive
+         FROM starline_slots WHERE id = :id LIMIT 1`,
+        { id: body.marketId }
+      );
+      if (!slots[0] || !slots[0].isActive) {
+        return res.status(403).json({
+          ok: false,
+          error: 'STARLINE_OFF',
+          message: 'This Starline game is currently disabled',
+        });
+      }
+      const nowM = new Date().getHours() * 60 + new Date().getMinutes();
+      if (nowM >= Number(slots[0].closeMinutes)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'STARLINE_CLOSED',
+          message: 'This Starline slot is closed',
+        });
+      }
+    }
+
+    // Jackpot: open-only + reject after slot close / inactive
+    if (body.marketId.startsWith('jackpot-')) {
+      for (const b of body.bids) {
+        if (b.session && b.session !== 'open') {
+          return res.status(400).json({
+            ok: false,
+            error: 'JACKPOT_OPEN_ONLY',
+            message: 'Jackpot accepts Open session only',
+          });
+        }
+        b.session = 'open';
+      }
+      const slots = await query(
+        `SELECT close_minutes AS closeMinutes, is_active AS isActive
+         FROM jackpot_slots WHERE id = :id LIMIT 1`,
+        { id: body.marketId }
+      );
+      if (!slots[0] || !slots[0].isActive) {
+        return res.status(403).json({
+          ok: false,
+          error: 'JACKPOT_OFF',
+          message: 'This Jackpot game is currently disabled',
+        });
+      }
+      const nowM = new Date().getHours() * 60 + new Date().getMinutes();
+      if (nowM >= Number(slots[0].closeMinutes)) {
+        return res.status(400).json({
+          ok: false,
+          error: 'JACKPOT_CLOSED',
+          message: 'This Jackpot slot is closed',
+        });
+      }
+    }
 
     const created = await withTransaction(async (conn) => {
       const [wallets] = await conn.execute(

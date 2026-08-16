@@ -1,5 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const { getAppSettings } = require('../../services/appSettings');
 const crypto = require('crypto');
 const { z } = require('zod');
 const { query } = require('../../config/db');
@@ -105,14 +106,14 @@ router.post('/send-otp', async (req, res, next) => {
       return res.status(409).json({
         ok: false,
         error: 'ALREADY_REGISTERED',
-        message: 'Number already registered — password se login karo',
+        message: 'Number already registered — please log in with your password',
       });
     }
     if (body.purpose === 'forgot' && !exists) {
       return res.status(404).json({
         ok: false,
         error: 'NOT_REGISTERED',
-        message: 'Yeh number registered nahi hai',
+        message: 'This number is not registered',
       });
     }
 
@@ -264,15 +265,29 @@ router.post('/set-password', async (req, res, next) => {
 
     const hash = await bcrypt.hash(body.password, 10);
     const name = (body.name || `Player ${phone.slice(-4)}`).trim();
+    const settings = await getAppSettings();
+    const userStatus = settings.autoApprove ? 'active' : 'blocked';
+    const welcomeBonus = Number(settings.welcomeBonus || 0);
+
     const result = await query(
-      `INSERT INTO users (login_id, phone, password_hash, name, role)
-       VALUES (:loginId, :phone, :hash, :name, 'player')`,
-      { loginId: phone, phone, hash, name }
+      `INSERT INTO users (login_id, phone, password_hash, name, role, status)
+       VALUES (:loginId, :phone, :hash, :name, 'player', :status)`,
+      { loginId: phone, phone, hash, name, status: userStatus }
     );
     const userId = result.insertId;
-    await query(`INSERT INTO wallets (user_id, balance) VALUES (:userId, 0)`, {
-      userId,
-    });
+    const initialBalance = welcomeBonus > 0 ? welcomeBonus : 0;
+    await query(
+      `INSERT INTO wallets (user_id, balance) VALUES (:userId, :balance)`,
+      { userId, balance: initialBalance }
+    );
+    if (welcomeBonus > 0) {
+      await query(
+        `INSERT INTO wallet_ledger
+          (user_id, type, amount, balance_after, note, ref_type)
+         VALUES (:userId, 'deposit', :amount, :balance, 'Welcome bonus', 'welcome_bonus')`,
+        { userId, amount: welcomeBonus, balance: initialBalance }
+      );
+    }
 
     const user = {
       id: userId,
@@ -292,7 +307,7 @@ router.post('/set-password', async (req, res, next) => {
   }
 });
 
-/** Existing user: seedha password login (OTP nahi) */
+/** Existing user: password login (no OTP) */
 router.post('/login-password', async (req, res, next) => {
   try {
     const body = z
@@ -318,6 +333,13 @@ router.post('/login-password', async (req, res, next) => {
     );
     const user = rows[0];
     if (!user || user.status !== 'active') {
+      if (user && user.status === 'blocked') {
+        return res.status(403).json({
+          ok: false,
+          error: 'ACCOUNT_PENDING',
+          message: 'Account pending admin approval',
+        });
+      }
       return res.status(401).json({ ok: false, error: 'INVALID_CREDENTIALS' });
     }
     const ok = await bcrypt.compare(body.password, user.password_hash);

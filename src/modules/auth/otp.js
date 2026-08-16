@@ -2,60 +2,77 @@ const crypto = require('crypto');
 const { config } = require('../../config/env');
 
 /**
- * SMS / OTP sender — plug your provider via env.
- * OTP_SMS_URL + OTP_SMS_API_KEY: POST JSON { phone, message, otp }
- * OTP_MOCK=true: console log OTP (dev)
+ * Jaipur SMS Hub (sms.jaipurmshub.in) — multipart/form-data:
+ *   sender_id, message, mobile_no, dlt_template_id
+ *   Authorization: Bearer <token>
  */
 async function sendSmsOtp(phone, otp, purpose) {
-  const message = `SARA 567 OTP: ${otp}. Purpose: ${purpose}. Valid 5 min. Do not share.`;
+  const message = (
+    config.otp.messageTemplate ||
+    'Hi Your User OTP is: {otp} Thank you ! COMPANY NAME PTPSMS'
+  ).replace(/\{otp\}/g, otp);
 
   if (config.otp.mock) {
     console.log(`[OTP MOCK] phone=${phone} purpose=${purpose} otp=${otp}`);
     return { mock: true, otp: config.env === 'development' ? otp : undefined };
   }
 
-  if (!config.otp.smsUrl) {
+  if (!config.otp.smsUrl || !config.otp.apiKey) {
     const err = new Error('OTP SMS provider not configured');
     err.status = 503;
     err.code = 'OTP_PROVIDER_MISSING';
     throw err;
   }
 
-  const res = await fetch(config.otp.smsUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.otp.apiKey}`,
-      ...(config.otp.extraHeaders || {}),
-    },
-    body: JSON.stringify({
-      phone,
-      mobile: phone,
-      otp,
-      message,
-      purpose,
-      ...(config.otp.extraBody || {}),
-    }),
-    signal: AbortSignal.timeout(1500),
-  });
+  const form = new FormData();
+  form.append('sender_id', config.otp.senderId || 'PTPSMS');
+  form.append('message', message);
+  form.append('mobile_no', phone);
+  form.append('dlt_template_id', config.otp.dltTemplateId || '');
+
+  let res;
+  try {
+    res = await fetch(config.otp.smsUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.otp.apiKey}`,
+      },
+      body: form,
+      signal: AbortSignal.timeout(config.otp.sendTimeoutMs || 8000),
+    });
+  } catch (fetchErr) {
+    const err = new Error(`SMS network error: ${fetchErr.message}`);
+    err.status = 502;
+    err.code = 'SMS_NETWORK';
+    throw err;
+  }
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // plain text response
+  }
 
   if (!res.ok) {
-    const text = await res.text();
-    const err = new Error(`SMS send failed: ${text}`);
+    const err = new Error(`SMS send failed (${res.status}): ${text}`);
     err.status = 502;
     err.code = 'SMS_FAILED';
     throw err;
   }
 
-  return { ok: true };
+  console.log(`[OTP] SMS sent to ${phone} purpose=${purpose}`);
+  return { ok: true, provider: data };
 }
 
 function hashOtp(code) {
   return crypto.createHash('sha256').update(String(code)).digest('hex');
 }
 
+/** 4-digit OTP — matches DLT template sample */
 function generateOtp() {
-  return String(Math.floor(100000 + Math.random() * 900000));
+  return String(Math.floor(1000 + Math.random() * 9000));
 }
 
 function normalizePhone(phone) {

@@ -38,7 +38,15 @@ CREATE TABLE IF NOT EXISTS media_files (
   CONSTRAINT fk_media_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE UNIQUE INDEX uq_users_phone ON users (phone);
+-- Safe unique index on phone
+SET @idx := (
+  SELECT COUNT(*) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'users' AND INDEX_NAME = 'uq_users_phone'
+);
+SET @sql := IF(@idx = 0, 'CREATE UNIQUE INDEX uq_users_phone ON users (phone)', 'SELECT 1');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Align markets with player app IDs
 DELETE FROM markets;

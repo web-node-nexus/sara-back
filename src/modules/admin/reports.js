@@ -1,0 +1,859 @@
+const express = require('express');
+const { z } = require('zod');
+const { query } = require('../../config/db');
+const { requireAuth, requireRole } = require('../../middleware/auth');
+const {
+  istDateString,
+  istDayBounds,
+  toMysqlDatetime,
+} = require('../../utils/istDate');
+
+const router = express.Router();
+
+function money(n) {
+  return Number(n || 0);
+}
+
+const BID_REPORT_TYPES = [
+  'Single Digit',
+  'Jodi Digit',
+  'Single Pana',
+  'Double Pana',
+  'Triple Pana',
+  'Half Sangam',
+  'Full Sangam',
+];
+
+function reportTypeForBid(gameId, gameName) {
+  const value = `${gameId || ''} ${gameName || ''}`.toLowerCase();
+  if (value.includes('half') && value.includes('sangam')) return 'Half Sangam';
+  if (value.includes('full') && value.includes('sangam')) return 'Full Sangam';
+  if (value.includes('triple') && (value.includes('pana') || value.includes('panna'))) {
+    return 'Triple Pana';
+  }
+  if (value.includes('double') && (value.includes('pana') || value.includes('panna'))) {
+    return 'Double Pana';
+  }
+  if (value.includes('single') && (value.includes('pana') || value.includes('panna'))) {
+    return 'Single Pana';
+  }
+  if (
+    value.includes('jodi') ||
+    value.includes('double digit') ||
+    value.includes('double-digit')
+  ) {
+    return 'Jodi Digit';
+  }
+  if (value.includes('single') && value.includes('digit')) return 'Single Digit';
+  return String(gameName || gameId || 'Other');
+}
+
+/**
+ * Detailed bid report grouped like the admin reference screen.
+ * Date boundaries use IST; user search only changes the included user's bids.
+ */
+router.get(
+  '/bids',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          gameType: z.string().optional(),
+          marketId: z.string().optional(),
+          session: z.enum(['all', 'open', 'close']).optional(),
+          search: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const date = (q.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const startSql = toMysqlDatetime(start);
+      const endSql = toMysqlDatetime(end);
+      const gameType = String(q.gameType || '').trim();
+      const marketId = String(q.marketId || '').trim();
+      const session = q.session || 'all';
+      const search = String(q.search || '').trim();
+
+      const params = { startSql, endSql, marketId };
+      let userFilterSql = '';
+      let matchedUsers = [];
+
+      if (search) {
+        matchedUsers = await query(
+          `SELECT id, name, phone, login_id AS loginId
+           FROM users
+           WHERE role = 'player'
+             AND (
+               name LIKE CONCAT('%', :search, '%')
+               OR phone LIKE CONCAT('%', :search, '%')
+               OR login_id LIKE CONCAT('%', :search, '%')
+             )
+           ORDER BY name
+           LIMIT 50`,
+          { search }
+        );
+
+        if (!matchedUsers.length) {
+          const markets = await query(
+            `SELECT id, name FROM markets WHERE is_active = 1
+             ORDER BY sort_order, name`
+          );
+          return res.json({
+            ok: true,
+            date,
+            filters: { gameType, marketId, session, search },
+            matchedUsers: [],
+            totalBet: 0,
+            totalAmount: 0,
+            totalWinAmount: 0,
+            groups: [],
+            gameTypes: BID_REPORT_TYPES,
+            markets,
+          });
+        }
+
+        const userKeys = matchedUsers.map((user, index) => {
+          const key = `reportUid${index}`;
+          params[key] = user.id;
+          return `:${key}`;
+        });
+        userFilterSql = `AND b.user_id IN (${userKeys.join(',')})`;
+      }
+
+      let sessionSql = '';
+      if (session === 'open') {
+        sessionSql = `AND (b.session = 'open' OR b.session IS NULL)`;
+      } else if (session === 'close') {
+        sessionSql = `AND b.session = 'close'`;
+      }
+
+      const rows = await query(
+        `SELECT
+           b.market_id AS marketId,
+           MAX(b.market_name) AS marketName,
+           b.game_id AS gameId,
+           MAX(b.game_name) AS gameName,
+           COALESCE(b.session, 'open') AS session,
+           b.number_value AS number,
+           COUNT(*) AS betCount,
+           COALESCE(SUM(b.points), 0) AS betAmount,
+           COALESCE(SUM(b.win_amount), 0) AS winAmount
+         FROM bids b
+         WHERE b.created_at >= :startSql
+           AND b.created_at < :endSql
+           AND (:marketId = '' OR b.market_id = :marketId)
+           ${userFilterSql}
+           ${sessionSql}
+         GROUP BY
+           b.market_id, b.game_id, COALESCE(b.session, 'open'), b.number_value
+         ORDER BY
+           MAX(b.game_name), MAX(b.market_name),
+           COALESCE(b.session, 'open'), b.number_value`,
+        params
+      );
+
+      const groupMap = new Map();
+      let totalBet = 0;
+      let totalAmount = 0;
+      let totalWinAmount = 0;
+
+      for (const row of rows) {
+        const type = reportTypeForBid(row.gameId, row.gameName);
+        if (gameType && type !== gameType) continue;
+
+        const item = {
+          marketId: row.marketId,
+          marketName: row.marketName,
+          gameId: row.gameId,
+          gameName: row.gameName,
+          type,
+          session: row.session === 'close' ? 'Close' : 'Open',
+          number: row.number,
+          betCount: Number(row.betCount || 0),
+          betAmount: money(row.betAmount),
+          winAmount: money(row.winAmount),
+        };
+
+        if (!groupMap.has(type)) {
+          groupMap.set(type, {
+            type,
+            totalBet: 0,
+            totalAmount: 0,
+            totalWinAmount: 0,
+            items: [],
+          });
+        }
+        const group = groupMap.get(type);
+        group.items.push(item);
+        group.totalBet += item.betCount;
+        group.totalAmount += item.betAmount;
+        group.totalWinAmount += item.winAmount;
+        totalBet += item.betCount;
+        totalAmount += item.betAmount;
+        totalWinAmount += item.winAmount;
+      }
+
+      const groups = BID_REPORT_TYPES.map((type) => {
+        return (
+          groupMap.get(type) || {
+            type,
+            totalBet: 0,
+            totalAmount: 0,
+            totalWinAmount: 0,
+            items: [],
+          }
+        );
+      });
+      for (const [type, group] of groupMap) {
+        if (!BID_REPORT_TYPES.includes(type)) groups.push(group);
+      }
+
+      const markets = await query(
+        `SELECT id, name FROM markets WHERE is_active = 1
+         ORDER BY sort_order, name`
+      );
+
+      res.json({
+        ok: true,
+        date,
+        filters: { gameType, marketId, session, search },
+        matchedUsers,
+        totalBet,
+        totalAmount,
+        totalWinAmount,
+        groups,
+        gameTypes: BID_REPORT_TYPES,
+        markets,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * Profit / Loss by market for an IST calendar day.
+ *
+ * Filters:
+ * - date: IST day (bids in that day)
+ * - marketId: single market
+ * - session: open | close | open-close | all
+ * - search: user name / phone / login — only markets where THAT user bid,
+ *   amounts = that user's bid/win/pl only
+ */
+router.get(
+  '/profit-loss',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          marketId: z.string().optional(),
+          session: z.enum(['all', 'open', 'close', 'open-close']).optional(),
+          search: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const date = (q.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const startSql = toMysqlDatetime(start);
+      const endSql = toMysqlDatetime(end);
+      const marketId = (q.marketId || '').trim();
+      const session = q.session || 'open-close';
+      const search = (q.search || '').trim();
+
+      // Resolve users for "Search For a User"
+      let matchedUsers = [];
+      let userFilterSql = '';
+      const params = {
+        startSql,
+        endSql,
+        marketId,
+      };
+
+      if (search) {
+        matchedUsers = await query(
+          `SELECT id, name, phone, login_id AS loginId
+           FROM users
+           WHERE role = 'player'
+             AND (
+               name LIKE CONCAT('%', :search, '%')
+               OR phone LIKE CONCAT('%', :search, '%')
+               OR login_id LIKE CONCAT('%', :search, '%')
+             )
+           LIMIT 50`,
+          { search }
+        );
+
+        if (!matchedUsers.length) {
+          const markets = await query(
+            `SELECT id, name FROM markets WHERE is_active = 1 ORDER BY sort_order, name`
+          );
+          return res.json({
+            ok: true,
+            date,
+            session,
+            search,
+            matchedUsers: [],
+            items: [],
+            totals: { bidAmount: 0, winAmount: 0, pl: 0 },
+            markets: markets.map((m) => ({ id: m.id, name: m.name })),
+          });
+        }
+
+        const keys = matchedUsers.map((u, i) => {
+          const k = `uid${i}`;
+          params[k] = u.id;
+          return `:${k}`;
+        });
+        userFilterSql = `AND b.user_id IN (${keys.join(',')})`;
+      }
+
+      // Session filter — Open / Close amounts separate
+      let sessionClause = '';
+      if (session === 'open') {
+        // Legacy null session treated as open
+        sessionClause = `AND (b.session = 'open' OR b.session IS NULL)`;
+      } else if (session === 'close') {
+        sessionClause = `AND b.session = 'close'`;
+      }
+      // open-close / all → both sessions combined
+
+      const bidAgg = await query(
+        `SELECT
+           b.market_id AS marketId,
+           MAX(b.market_name) AS marketName,
+           COALESCE(SUM(b.points), 0) AS bidAmount,
+           COALESCE(SUM(b.win_amount), 0) AS winAmount,
+           COUNT(*) AS bidCount
+         FROM bids b
+         WHERE b.created_at >= :startSql
+           AND b.created_at < :endSql
+           AND (:marketId = '' OR b.market_id = :marketId)
+           ${userFilterSql}
+           ${sessionClause}
+         GROUP BY b.market_id
+         ORDER BY bidAmount DESC, marketName ASC`,
+        params
+      );
+
+      const dailyMeta = await query(
+        `SELECT market_id AS marketId, market_name AS marketName,
+                open_time AS openTime, close_time AS closeTime,
+                scrape_timing AS scrapeTiming, result,
+                result_declared AS resultDeclared
+         FROM market_daily
+         WHERE result_date = :date`,
+        { date }
+      );
+      const metaById = new Map(dailyMeta.map((d) => [d.marketId, d]));
+
+      let items;
+
+      if (search) {
+        // User search: ONLY markets jahan us user ne paisa lagaya
+        items = bidAgg.map((b) => {
+          const meta = metaById.get(b.marketId);
+          const bidAmount = money(b.bidAmount);
+          const winAmount = money(b.winAmount);
+          return {
+            marketId: b.marketId,
+            marketName: b.marketName || meta?.marketName || b.marketId,
+            bidAmount,
+            winAmount,
+            pl: bidAmount - winAmount,
+            bidCount: Number(b.bidCount || 0),
+            openTime: meta?.openTime || null,
+            closeTime: meta?.closeTime || null,
+            scrapeTiming: meta?.scrapeTiming || null,
+            result: meta?.result || null,
+            resultDeclared: Number(meta?.resultDeclared) === 1,
+          };
+        });
+      } else {
+        // Overview: daily markets + bid totals (zeros allowed)
+        const byId = new Map();
+        for (const d of dailyMeta) {
+          if (marketId && d.marketId !== marketId) continue;
+          byId.set(d.marketId, {
+            marketId: d.marketId,
+            marketName: d.marketName,
+            bidAmount: 0,
+            winAmount: 0,
+            pl: 0,
+            bidCount: 0,
+            openTime: d.openTime,
+            closeTime: d.closeTime,
+            scrapeTiming: d.scrapeTiming,
+            result: d.result,
+            resultDeclared: Number(d.resultDeclared) === 1,
+          });
+        }
+        for (const b of bidAgg) {
+          const meta = byId.get(b.marketId) || metaById.get(b.marketId);
+          const bidAmount = money(b.bidAmount);
+          const winAmount = money(b.winAmount);
+          byId.set(b.marketId, {
+            marketId: b.marketId,
+            marketName:
+              b.marketName || meta?.marketName || b.marketId,
+            bidAmount,
+            winAmount,
+            pl: bidAmount - winAmount,
+            bidCount: Number(b.bidCount || 0),
+            openTime: meta?.openTime || null,
+            closeTime: meta?.closeTime || null,
+            scrapeTiming: meta?.scrapeTiming || null,
+            result: meta?.result || null,
+            resultDeclared: Number(meta?.resultDeclared) === 1,
+          });
+        }
+        items = Array.from(byId.values());
+        items.sort((a, b) => {
+          if (b.bidAmount !== a.bidAmount) return b.bidAmount - a.bidAmount;
+          return String(a.marketName).localeCompare(String(b.marketName));
+        });
+      }
+
+      const totals = items.reduce(
+        (acc, it) => {
+          acc.bidAmount += it.bidAmount;
+          acc.winAmount += it.winAmount;
+          acc.pl += it.pl;
+          return acc;
+        },
+        { bidAmount: 0, winAmount: 0, pl: 0 }
+      );
+
+      const markets = await query(
+        `SELECT id, name FROM markets WHERE is_active = 1 ORDER BY sort_order, name`
+      );
+
+      res.json({
+        ok: true,
+        date,
+        session,
+        search: search || '',
+        dayStart: startSql,
+        dayEnd: endSql,
+        matchedUsers: matchedUsers.map((u) => ({
+          id: u.id,
+          name: u.name,
+          phone: u.phone,
+          loginId: u.loginId,
+        })),
+        items,
+        totals,
+        markets: markets.map((m) => ({ id: m.id, name: m.name })),
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/** Today's (or date) scraped daily market rows from DB — not live HTML */
+router.get(
+  '/market-daily',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const date = String(req.query.date || istDateString()).slice(0, 10);
+      const marketId = String(req.query.marketId || '').trim();
+      const params = { date };
+      let where = 'md.result_date = :date';
+      if (marketId) {
+        where += ' AND md.market_id = :marketId';
+        params.marketId = marketId;
+      }
+      const rows = await query(
+        `SELECT md.id, md.market_id AS marketId, md.market_name AS marketName,
+                md.result_date AS resultDate, md.open_time AS openTime,
+                md.close_time AS closeTime, md.scrape_timing AS scrapeTiming,
+                md.result, md.result_declared AS resultDeclared,
+                md.first_seen_at AS firstSeenAt, md.last_seen_at AS lastSeenAt,
+                md.result_updated_at AS resultUpdatedAt,
+                m.source
+         FROM market_daily md
+         LEFT JOIN markets m ON m.id = md.market_id
+         WHERE ${where}
+         ORDER BY md.open_time IS NULL, md.open_time, md.market_name`,
+        params
+      );
+      res.json({
+        ok: true,
+        date,
+        items: rows.map((r) => ({
+          ...r,
+          resultDeclared: Number(r.resultDeclared) === 1,
+          source: r.source || 'scrape',
+        })),
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/** Market-wise result history (last N days) */
+router.get(
+  '/results/history',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const marketId = String(req.query.marketId || '').trim();
+      const limit = Math.min(Math.max(Number(req.query.limit) || 60, 1), 180);
+      if (!marketId) {
+        return res.status(400).json({
+          ok: false,
+          error: 'MARKET_REQUIRED',
+          message: 'marketId is required',
+        });
+      }
+      const rows = await query(
+        `SELECT md.market_id AS marketId, md.market_name AS marketName,
+                md.result_date AS resultDate, md.open_time AS openTime,
+                md.close_time AS closeTime, md.result,
+                md.result_declared AS resultDeclared,
+                md.result_updated_at AS resultUpdatedAt,
+                m.source
+         FROM market_daily md
+         LEFT JOIN markets m ON m.id = md.market_id
+         WHERE md.market_id = :marketId
+         ORDER BY md.result_date DESC
+         LIMIT ${limit}`,
+        { marketId }
+      );
+      res.json({
+        ok: true,
+        marketId,
+        items: rows.map((r) => ({
+          ...r,
+          resultDeclared: Number(r.resultDeclared) === 1,
+          source: r.source || 'scrape',
+        })),
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * User Statement / Transaction — search by mobile, filter All|Win|Add|Withdraw|Bid
+ */
+router.get(
+  '/statement',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          phone: z.string().optional(),
+          type: z.enum(['all', 'win', 'add', 'withdraw', 'bid']).optional(),
+          limit: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const phone = String(q.phone || '')
+        .replace(/\D/g, '')
+        .slice(-10);
+      const type = q.type || 'all';
+      const limit = Math.min(Number(q.limit) || 200, 500);
+
+      if (phone.length !== 10) {
+        return res.json({
+          ok: true,
+          user: null,
+          type,
+          items: [],
+          message: 'Enter 10-digit mobile number',
+        });
+      }
+
+      const users = await query(
+        `SELECT u.id, u.name, u.phone, u.login_id AS loginId, u.status,
+                COALESCE(w.balance, 0) AS balance
+         FROM users u
+         LEFT JOIN wallets w ON w.user_id = u.id
+         WHERE u.role = 'player'
+           AND (
+             u.phone LIKE CONCAT('%', :phone)
+             OR u.login_id LIKE CONCAT('%', :phone)
+           )
+         ORDER BY u.id DESC
+         LIMIT 1`,
+        { phone }
+      );
+      const user = users[0];
+      if (!user) {
+        return res.json({
+          ok: true,
+          user: null,
+          type,
+          items: [],
+          message: 'User nahi mila',
+        });
+      }
+
+      let typeSql = '';
+      if (type === 'win') typeSql = `AND l.type = 'win'`;
+      else if (type === 'add') typeSql = `AND l.type IN ('deposit', 'adjust')`;
+      else if (type === 'withdraw') typeSql = `AND l.type = 'withdraw'`;
+      else if (type === 'bid') typeSql = `AND l.type = 'bid'`;
+
+      const rows = await query(
+        `SELECT id, type, amount, balance_after AS balanceAfter,
+                note, ref_type AS refType, ref_id AS refId,
+                created_at AS createdAt
+         FROM wallet_ledger l
+         WHERE user_id = :userId
+           ${typeSql}
+         ORDER BY id DESC
+         LIMIT ${limit}`,
+        { userId: user.id }
+      );
+
+      const items = rows.map((r) => {
+        const ledgerType = r.type;
+        let tab = 'All';
+        if (ledgerType === 'win') tab = 'Win';
+        else if (ledgerType === 'deposit' || ledgerType === 'adjust') tab = 'Add';
+        else if (ledgerType === 'withdraw') tab = 'Withdraw';
+        else if (ledgerType === 'bid') tab = 'Bid';
+
+        const amt = money(r.amount);
+        const signed =
+          ledgerType === 'withdraw' || ledgerType === 'bid'
+            ? -Math.abs(amt)
+            : amt;
+
+        return {
+          id: r.id,
+          type: ledgerType,
+          tab,
+          amount: amt,
+          signedAmount: signed,
+          balanceAfter: money(r.balanceAfter),
+          note: r.note || '',
+          refType: r.refType || null,
+          refId: r.refId || null,
+          createdAt: r.createdAt,
+          title:
+            ledgerType === 'win'
+              ? 'Win Credit'
+              : ledgerType === 'deposit'
+                ? 'Deposit'
+                : ledgerType === 'adjust'
+                  ? 'Admin Adjust'
+                  : ledgerType === 'withdraw'
+                    ? 'Withdrawal'
+                    : ledgerType === 'bid'
+                      ? 'Bid Deduct'
+                      : ledgerType,
+        };
+      });
+
+      res.json({
+        ok: true,
+        user: {
+          id: user.id,
+          name: user.name,
+          phone: user.phone,
+          loginId: user.loginId,
+          status: user.status,
+          balance: money(user.balance),
+        },
+        type,
+        items,
+        total: items.length,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * Bid / Win History — filterable bid records with status
+ */
+router.get(
+  '/win-history',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          marketId: z.string().optional(),
+          gameType: z.string().optional(),
+          session: z.enum(['all', 'open', 'close', 'both']).optional(),
+          status: z
+            .enum(['all', 'won', 'lost', 'pending', 'cancelled'])
+            .optional(),
+          searchUser: z.string().optional(),
+          searchNumber: z.string().optional(),
+          limit: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const date = (q.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const startSql = toMysqlDatetime(start);
+      const endSql = toMysqlDatetime(end);
+      const marketId = String(q.marketId || '').trim();
+      const gameType = String(q.gameType || '').trim();
+      const session = q.session === 'both' ? 'all' : q.session || 'all';
+      const status = q.status || 'all';
+      const searchUser = String(q.searchUser || '').trim();
+      const searchNumber = String(q.searchNumber || '').trim();
+      const limit = Math.min(Number(q.limit) || 300, 500);
+
+      const params = { startSql, endSql, marketId, searchNumber };
+      let userSql = '';
+      let sessionSql = '';
+      let statusSql = '';
+
+      if (searchUser) {
+        const matched = await query(
+          `SELECT id FROM users
+           WHERE role = 'player'
+             AND (
+               name LIKE CONCAT('%', :searchUser, '%')
+               OR phone LIKE CONCAT('%', :searchUser, '%')
+               OR login_id LIKE CONCAT('%', :searchUser, '%')
+             )
+           LIMIT 50`,
+          { searchUser }
+        );
+        if (!matched.length) {
+          const markets = await query(
+            `SELECT id, name FROM markets WHERE is_active = 1
+             ORDER BY sort_order, name`
+          );
+          return res.json({
+            ok: true,
+            date,
+            total: 0,
+            items: [],
+            markets,
+            gameTypes: BID_REPORT_TYPES,
+            filters: {
+              marketId,
+              gameType,
+              session,
+              status,
+              searchUser,
+              searchNumber,
+            },
+          });
+        }
+        const keys = matched.map((u, i) => {
+          const k = `whUid${i}`;
+          params[k] = u.id;
+          return `:${k}`;
+        });
+        userSql = `AND b.user_id IN (${keys.join(',')})`;
+      }
+
+      if (session === 'open') {
+        sessionSql = `AND (b.session = 'open' OR b.session IS NULL)`;
+      } else if (session === 'close') {
+        sessionSql = `AND b.session = 'close'`;
+      }
+
+      if (status !== 'all') {
+        statusSql = `AND b.status = :status`;
+        params.status = status;
+      }
+
+      const rows = await query(
+        `SELECT
+           b.id,
+           b.user_id AS userId,
+           u.name AS userName,
+           u.phone AS userPhone,
+           b.market_id AS marketId,
+           b.market_name AS marketName,
+           b.game_id AS gameId,
+           b.game_name AS gameName,
+           b.number_value AS number,
+           b.points,
+           COALESCE(b.win_amount, 0) AS winAmount,
+           COALESCE(b.session, 'open') AS session,
+           b.status,
+           b.created_at AS createdAt
+         FROM bids b
+         LEFT JOIN users u ON u.id = b.user_id
+         WHERE b.created_at >= :startSql
+           AND b.created_at < :endSql
+           AND (:marketId = '' OR b.market_id = :marketId)
+           AND (:searchNumber = '' OR b.number_value LIKE CONCAT('%', :searchNumber, '%'))
+           ${userSql}
+           ${sessionSql}
+           ${statusSql}
+         ORDER BY b.id DESC
+         LIMIT ${limit}`,
+        params
+      );
+
+      const items = [];
+      for (const r of rows) {
+        const type = reportTypeForBid(r.gameId, r.gameName);
+        if (gameType && type !== gameType) continue;
+        items.push({
+          id: r.id,
+          userId: r.userId,
+          userName: r.userName || '—',
+          userPhone: r.userPhone || '',
+          marketId: r.marketId,
+          marketName: r.marketName,
+          gameId: r.gameId,
+          gameName: r.gameName,
+          type,
+          number: r.number,
+          points: money(r.points),
+          winAmount: money(r.winAmount),
+          session: r.session === 'close' ? 'Close' : 'Open',
+          status: r.status,
+          createdAt: r.createdAt,
+        });
+      }
+
+      const markets = await query(
+        `SELECT id, name FROM markets WHERE is_active = 1
+         ORDER BY sort_order, name`
+      );
+
+      res.json({
+        ok: true,
+        date,
+        total: items.length,
+        items,
+        markets,
+        gameTypes: BID_REPORT_TYPES,
+        filters: {
+          marketId,
+          gameType,
+          session,
+          status,
+          searchUser,
+          searchNumber,
+        },
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+module.exports = router;

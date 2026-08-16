@@ -4,6 +4,9 @@ const { z } = require('zod');
 const { query, withTransaction } = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const cache = require('../../config/redis');
+const { notifySystemEventAsync } = require('../../services/notificationService');
+const { createPayout } = require('../payments/imb');
+const { config } = require('../../config/env');
 
 const router = express.Router();
 
@@ -117,15 +120,24 @@ router.get(
   async (req, res, next) => {
     try {
       const limit = Math.min(Number(req.query.limit) || 50, 100);
+      const isAdmin = req.user.role === 'admin';
       const providerId =
-        req.user.role === 'admin' && req.query.providerId
+        isAdmin && req.query.providerId
           ? Number(req.query.providerId)
           : req.user.id;
+
+      // Shared inbox: assigned players OR anyone with a support thread
       const rows = await query(
         `SELECT u.id, u.name, u.phone, u.login_id AS loginId, u.status,
+                u.provider_id AS providerId,
                 w.balance AS walletBalance,
                 COALESCE(b.bidCount, 0) AS bidCount,
-                COALESCE(d.depositTotal, 0) AS depositTotal
+                COALESCE(d.depositTotal, 0) AS depositTotal,
+                (
+                  SELECT t.id FROM chat_threads t
+                  WHERE t.user_id = u.id
+                  ORDER BY t.updated_at DESC LIMIT 1
+                ) AS threadId
          FROM users u
          LEFT JOIN wallets w ON w.user_id = u.id
          LEFT JOIN (
@@ -135,10 +147,17 @@ router.get(
            SELECT user_id, SUM(amount) AS depositTotal
            FROM wallet_ledger WHERE type = 'deposit' GROUP BY user_id
          ) d ON d.user_id = u.id
-         WHERE u.role = 'player' AND u.provider_id = :providerId
+         WHERE u.role = 'player'
+           AND (
+             :isAdmin = 1
+             OR u.provider_id = :providerId
+             OR EXISTS (
+               SELECT 1 FROM chat_threads t WHERE t.user_id = u.id
+             )
+           )
          ORDER BY u.id DESC
          LIMIT ${limit}`,
-        { providerId }
+        { providerId, isAdmin: isAdmin ? 1 : 0 }
       );
       res.json({ ok: true, items: rows });
     } catch (err) {
@@ -156,7 +175,12 @@ router.get(
       const id = Number(req.params.id);
       const users = await query(
         `SELECT u.id, u.name, u.phone, u.login_id AS loginId, u.status, u.provider_id AS providerId,
-                w.balance AS walletBalance
+                w.balance AS walletBalance,
+                (
+                  SELECT t.id FROM chat_threads t
+                  WHERE t.user_id = u.id
+                  ORDER BY t.updated_at DESC LIMIT 1
+                ) AS threadId
          FROM users u
          LEFT JOIN wallets w ON w.user_id = u.id
          WHERE u.id = :id AND u.role = 'player'
@@ -167,11 +191,12 @@ router.get(
       if (!user) {
         return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
       }
-      if (
-        req.user.role === 'provider' &&
-        Number(user.providerId) !== Number(req.user.id)
-      ) {
-        return res.status(403).json({ ok: false, error: 'FORBIDDEN' });
+      if (req.user.role === 'provider') {
+        const assigned = Number(user.providerId) === Number(req.user.id);
+        const hasThread = !!user.threadId;
+        if (!assigned && !hasThread) {
+          return res.status(403).json({ ok: false, error: 'FORBIDDEN' });
+        }
       }
       const bids = await query(
         `SELECT id, market_name AS marketName, game_name AS gameName, number_value AS number,
@@ -184,7 +209,19 @@ router.get(
          FROM wallet_ledger WHERE user_id = :id ORDER BY id DESC LIMIT 50`,
         { id }
       );
-      res.json({ ok: true, user, bids, txns });
+      const depositTotal = txns
+        .filter((t) => t.type === 'deposit')
+        .reduce((s, t) => s + Number(t.amount || 0), 0);
+      res.json({
+        ok: true,
+        user,
+        bids,
+        txns,
+        stats: {
+          bidCount: bids.length,
+          depositTotal,
+        },
+      });
     } catch (err) {
       next(err);
     }
@@ -216,14 +253,32 @@ router.get(
   requireRole('admin', 'provider'),
   async (req, res, next) => {
     try {
+      const status = String(req.query.status || 'pending');
+      const statuses =
+        status === 'all'
+          ? ['pending', 'processing', 'approved', 'paid', 'rejected']
+          : status === 'open'
+            ? ['pending', 'processing']
+            : [status];
+      const named = {};
+      const keys = statuses.map((s, i) => {
+        const k = `s${i}`;
+        named[k] = s;
+        return `:${k}`;
+      });
       const rows = await query(
         `SELECT w.id, w.user_id AS userId, w.amount, w.status, w.note,
+                w.upi_id AS upiId, w.account_name AS accountName,
+                w.account_number AS accountNumber, w.ifsc, w.bank_name AS bankName,
+                w.client_ref_id AS clientRefId, w.payout_txn_id AS payoutTxnId,
+                w.payout_status AS payoutStatus,
                 w.created_at AS createdAt, u.name AS userName, u.phone
          FROM withdraw_requests w
          JOIN users u ON u.id = w.user_id
-         WHERE w.status = 'pending'
-         ORDER BY w.id ASC
-         LIMIT 100`
+         WHERE w.status IN (${keys.join(',')})
+         ORDER BY w.id DESC
+         LIMIT 100`,
+        named
       );
       res.json({ ok: true, items: rows });
     } catch (err) {
@@ -243,18 +298,24 @@ router.post(
         .object({ decision: z.enum(['approved', 'rejected']) })
         .parse(req.body);
 
-      const out = await withTransaction(async (conn) => {
-        const [rows] = await conn.execute(
-          `SELECT * FROM withdraw_requests WHERE id = ? FOR UPDATE`,
-          [id]
-        );
-        const wr = rows[0];
-        if (!wr || wr.status !== 'pending') {
-          const err = new Error('Not found or already decided');
-          err.status = 404;
-          throw err;
-        }
-        if (body.decision === 'rejected') {
+      if (body.decision === 'rejected') {
+        const out = await withTransaction(async (conn) => {
+          const [rows] = await conn.execute(
+            `SELECT * FROM withdraw_requests WHERE id = ? FOR UPDATE`,
+            [id]
+          );
+          const wr = rows[0];
+          if (!wr || !['pending', 'processing'].includes(wr.status)) {
+            const err = new Error('Not found or already decided');
+            err.status = 404;
+            throw err;
+          }
+          if (wr.status === 'processing') {
+            const err = new Error('Payout already in progress');
+            err.status = 409;
+            err.code = 'PAYOUT_IN_PROGRESS';
+            throw err;
+          }
           const [wallets] = await conn.execute(
             `SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE`,
             [wr.user_id]
@@ -275,16 +336,125 @@ router.post(
             [id]
           );
           await cache.del(`wallet:${wr.user_id}`);
-          return { status: 'rejected', balance };
-        }
-        await conn.execute(
-          `UPDATE withdraw_requests SET status = 'approved' WHERE id = ?`,
+          return {
+            status: 'rejected',
+            balance,
+            userId: wr.user_id,
+            amount: wr.amount,
+          };
+        });
+        const users = await query(
+          `SELECT name FROM users WHERE id = :id LIMIT 1`,
+          { id: out.userId }
+        );
+        const userName = users[0]?.name || 'User';
+        notifySystemEventAsync({
+          userId: out.userId,
+          kind: 'withdraw',
+          title: 'Withdrawal Rejected',
+          message: `Dear ${userName}, Your withdrawal request of Rs.${Number(out.amount).toLocaleString('en-IN')} has been rejected. Amount refunded to wallet.`,
+        });
+        return res.json({ ok: true, status: out.status, balance: out.balance });
+      }
+
+      // Approve → initiate IMB payout
+      const locked = await withTransaction(async (conn) => {
+        const [rows] = await conn.execute(
+          `SELECT * FROM withdraw_requests WHERE id = ? FOR UPDATE`,
           [id]
         );
-        return { status: 'approved' };
+        const wr = rows[0];
+        if (!wr || wr.status !== 'pending') {
+          const err = new Error('Not found or already decided');
+          err.status = 404;
+          throw err;
+        }
+        const clientRef = `WD${id}_${Date.now()}`;
+        await conn.execute(
+          `UPDATE withdraw_requests
+           SET status = 'processing', client_ref_id = ?, payout_status = 'Initiated'
+           WHERE id = ?`,
+          [clientRef, id]
+        );
+        return { ...wr, client_ref_id: clientRef };
       });
 
-      res.json({ ok: true, ...out });
+      try {
+        const payout = await createPayout({
+          amount: locked.amount,
+          clientRef: locked.client_ref_id,
+          accountNumber: locked.account_number,
+          ifsc: locked.ifsc,
+          accountName:
+            locked.account_name ||
+            locked.upi_id ||
+            `user-${locked.user_id}`,
+          bankName: locked.bank_name,
+          upiId: locked.upi_id,
+          tag: `SARA567 WD${id}`,
+        });
+
+        const finalStatus =
+          config.imb.mock || Number(payout.responseCode) === 112
+            ? 'paid'
+            : 'processing';
+
+        await query(
+          `UPDATE withdraw_requests
+           SET status = :status,
+               payout_txn_id = :txn,
+               payout_status = :pst
+           WHERE id = :id`,
+          {
+            status: finalStatus,
+            txn: payout.txnId,
+            pst: payout.status || 'Initiated',
+            id,
+          }
+        );
+
+        res.json({
+          ok: true,
+          status: finalStatus,
+          payoutTxnId: payout.txnId,
+          clientRefId: locked.client_ref_id,
+        });
+      } catch (payoutErr) {
+        await withTransaction(async (conn) => {
+          const [rows] = await conn.execute(
+            `SELECT * FROM withdraw_requests WHERE id = ? FOR UPDATE`,
+            [id]
+          );
+          const wr = rows[0];
+          if (!wr || wr.status === 'paid' || wr.status === 'rejected') return;
+          const [wallets] = await conn.execute(
+            `SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE`,
+            [wr.user_id]
+          );
+          const balance = Number(wallets[0].balance) + Number(wr.amount);
+          await conn.execute(
+            `UPDATE wallets SET balance = ?, version = version + 1 WHERE user_id = ?`,
+            [balance, wr.user_id]
+          );
+          await conn.execute(
+            `INSERT INTO wallet_ledger
+              (user_id, type, amount, balance_after, note, ref_type, ref_id)
+             VALUES (?, 'adjust', ?, ?, 'Withdraw payout failed — refund', 'withdraw_request', ?)`,
+            [wr.user_id, wr.amount, balance, String(id)]
+          );
+          await conn.execute(
+            `UPDATE withdraw_requests
+             SET status = 'rejected', payout_status = ?
+             WHERE id = ?`,
+            [payoutErr.message || 'Fail', id]
+          );
+          await cache.del(`wallet:${wr.user_id}`);
+        });
+        const err = new Error(payoutErr.message || 'Payout failed');
+        err.status = 502;
+        err.code = 'IMB_PAYOUT_FAILED';
+        throw err;
+      }
     } catch (err) {
       next(err);
     }

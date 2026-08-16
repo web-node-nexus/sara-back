@@ -39,7 +39,16 @@ router.post('/', requireAuth, upload.single('file'), async (req, res, next) => {
       req.body.kind && ['image', 'file', 'audio'].includes(req.body.kind)
         ? req.body.kind
         : kindFromMime(req.file.mimetype);
-    const publicUrl = `${config.publicBaseUrl}/uploads/media/${req.file.filename}`;
+    const host = req.get('host') || '127.0.0.1:4000';
+    // Prefer request host so phones on LAN get reachable URLs (not 127.0.0.1)
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http')
+      .toString()
+      .split(',')[0]
+      .trim();
+    const publicUrl =
+      config.publicBaseUrl && !/127\.0\.0\.1|localhost/i.test(config.publicBaseUrl)
+        ? `${config.publicBaseUrl.replace(/\/$/, '')}/uploads/media/${req.file.filename}`
+        : `${proto}://${host}/uploads/media/${req.file.filename}`;
     const result = await query(
       `INSERT INTO media_files
         (user_id, kind, original_name, mime, size_bytes, storage_path, public_url)
