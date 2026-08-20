@@ -1,5 +1,6 @@
 const express = require('express');
 const { getAppSettings, withdrawPublicConfig, bidPublicConfig } = require('../../services/appSettings');
+const { listAllRates, publicByKind } = require('../../services/gameRates');
 const { requireAuth } = require('../../middleware/auth');
 const { getPublicNotices } = require('../../services/noticeService');
 const {
@@ -13,6 +14,7 @@ const router = express.Router();
 router.get('/config', async (_req, res, next) => {
   try {
     const s = await getAppSettings();
+    const gameRates = publicByKind(await listAllRates());
     res.json({
       ok: true,
       config: {
@@ -37,6 +39,7 @@ router.get('/config', async (_req, res, next) => {
         },
         withdraw: withdrawPublicConfig(s),
         bid: bidPublicConfig(s),
+        gameRates,
       },
     });
   } catch (err) {

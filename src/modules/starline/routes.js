@@ -87,7 +87,7 @@ router.post(
 
       const slots = await query(
         `SELECT id, name, close_minutes AS closeMinutes
-         FROM starline_slots WHERE id = :id AND is_active = 1 LIMIT 1`,
+         FROM starline_slots WHERE id = :id LIMIT 1`,
         { id: body.slotId }
       );
       if (!slots[0]) {

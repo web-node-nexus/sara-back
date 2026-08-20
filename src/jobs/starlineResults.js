@@ -63,27 +63,11 @@ function isWinningBid(gameId, number, openDigit) {
   return ank != null && ank === openDigit;
 }
 
-/** Payout multipliers (points * rate/10 style → here points * multiplier) */
-function winAmount(gameId, points) {
-  const p = Number(points) || 0;
-  const map = {
-    'single-digit': 10,
-    'single-digit-bulk': 10,
-    'single-pana': 160,
-    'single-pana-bulk': 160,
-    'double-pana': 320,
-    'double-pana-bulk': 320,
-    'two-digit-pana': 320,
-    'triple-pana': 1000,
-    'triple-pana-bulk': 1000,
-    'pana-family': 160,
-    'sp-dp-tp': 160,
-    'sp-motor': 160,
-    'dp-motor': 320,
-    'odd-even': 10,
-  };
-  const mult = map[gameId] ?? 10;
-  return p * mult;
+const { payoutFor } = require('../services/gameRates');
+
+/** Payout from admin Game Rates: points * (rate / amount) */
+async function winAmount(gameId, points) {
+  return payoutFor('starline', gameId, points);
 }
 
 async function declareSlot(slot, today, opts = {}) {
@@ -151,7 +135,7 @@ async function declareSlot(slot, today, opts = {}) {
         { status: won ? 'won' : 'lost', id: b.id }
       );
       if (won) {
-        const payout = winAmount(b.gameId, b.points);
+        const payout = await winAmount(b.gameId, b.points);
         const [wallets] = await conn.execute(
           `SELECT balance FROM wallets WHERE user_id = :userId FOR UPDATE`,
           { userId: b.userId }

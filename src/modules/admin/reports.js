@@ -7,6 +7,7 @@ const {
   istDayBounds,
   toMysqlDatetime,
 } = require('../../utils/istDate');
+const { parseMatkaResult } = require('../../utils/matkaResult');
 
 const router = express.Router();
 
@@ -23,6 +24,133 @@ const BID_REPORT_TYPES = [
   'Half Sangam',
   'Full Sangam',
 ];
+
+function formatAmPm(timeStr) {
+  if (!timeStr) return '';
+  const [h, m] = String(timeStr).split(':').map(Number);
+  if (!Number.isFinite(h)) return String(timeStr).slice(0, 5);
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const hr = ((h + 11) % 12) + 1;
+  return `${String(hr).padStart(2, '0')}:${String(m || 0).padStart(2, '0')} ${ampm}`;
+}
+
+function displayDate(iso) {
+  const [y, m, d] = String(iso).split('-');
+  return `${d}/${m}/${y}`;
+}
+
+/**
+ * Report Generation board — every matka market (admin + scrape + seed)
+ * with open/close result state for the selected IST date.
+ */
+router.get(
+  '/board',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const date = String(req.query.date || istDateString()).slice(0, 10);
+      const rows = await query(
+        `SELECT m.id, m.name, m.open_time AS openTimeRaw, m.close_time AS closeTimeRaw,
+                m.source, m.is_active AS isActive, m.sort_order AS sortOrder,
+                md.result, md.result_declared AS resultDeclared
+         FROM markets m
+         LEFT JOIN market_daily md
+           ON md.market_id = m.id AND md.result_date = :date
+         WHERE m.id NOT LIKE 'starline-%'
+           AND m.id NOT LIKE 'jackpot-%'
+         ORDER BY m.open_time ASC, m.name ASC`,
+        { date }
+      );
+
+      const items = rows.map((r) => {
+        const parsed = parseMatkaResult(r.result);
+        return {
+          id: r.id,
+          name: r.name,
+          openTime: formatAmPm(r.openTimeRaw),
+          closeTime: formatAmPm(r.closeTimeRaw),
+          source: r.source,
+          play: !!r.isActive,
+          result: r.result || null,
+          resultDeclared: !!r.resultDeclared,
+          openResult: parsed.hasOpen ? parsed.openText || r.result : null,
+          closeResult: parsed.hasClose ? parsed.closeText : null,
+          hasOpen: parsed.hasOpen,
+          hasClose: parsed.hasClose,
+        };
+      });
+
+      res.json({
+        ok: true,
+        date,
+        dateLabel: displayDate(date),
+        items,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/** Starline / jackpot report board */
+router.get(
+  '/starline-board',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const date = String(req.query.date || istDateString()).slice(0, 10);
+      const kind = String(req.query.kind || 'starline').toLowerCase();
+      const isJackpot = kind === 'jackpot';
+      const slotTable = isJackpot ? 'jackpot_slots' : 'starline_slots';
+
+      let rows;
+      if (isJackpot) {
+        rows = await query(
+          `SELECT s.id, s.name, s.time_label AS timeLabel, s.is_active AS isActive,
+                  s.sort_order AS sortOrder, s.close_minutes AS closeMinutes,
+                  NULL AS result, NULL AS openDigit, NULL AS declaredAt
+           FROM ${slotTable} s
+           ORDER BY s.sort_order ASC, s.close_minutes ASC`
+        );
+      } else {
+        rows = await query(
+          `SELECT s.id, s.name, s.time_label AS timeLabel, s.is_active AS isActive,
+                  s.sort_order AS sortOrder, s.close_minutes AS closeMinutes,
+                  r.result_display AS result, r.open_digit AS openDigit,
+                  r.declared_at AS declaredAt
+           FROM starline_slots s
+           LEFT JOIN starline_results r
+             ON r.slot_id = s.id AND r.result_date = :date
+           ORDER BY s.sort_order ASC, s.close_minutes ASC`,
+          { date }
+        );
+      }
+
+      const items = rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        timeLabel: r.timeLabel,
+        play: !!r.isActive,
+        result: r.result || null,
+        openDigit: r.openDigit != null ? Number(r.openDigit) : null,
+        hasResult: !!(r.result && String(r.result).trim()),
+        declaredAt: r.declaredAt || null,
+      }));
+
+      res.json({
+        ok: true,
+        kind: isJackpot ? 'jackpot' : 'starline',
+        date,
+        dateLabel: displayDate(date),
+        items,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 function reportTypeForBid(gameId, gameName) {
   const value = `${gameId || ''} ${gameName || ''}`.toLowerCase();

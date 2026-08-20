@@ -3,7 +3,7 @@ const { z } = require('zod');
 const { query } = require('../../config/db');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const cache = require('../../config/redis');
-const { declareMarketResult } = require('../../services/declareResult');
+const { declareMarketResult, reverseMarketResult } = require('../../services/declareResult');
 
 const router = express.Router();
 
@@ -114,7 +114,7 @@ async function bustCache() {
   await cache.del('markets:v2');
 }
 
-/** Admin-created markets only — Game On/Off screen */
+/** All markets (admin + scrape + seed) — Game On/Off. User market shows only play=ON. */
 router.get(
   '/game-on-off',
   requireAuth,
@@ -126,8 +126,11 @@ router.get(
                 is_active AS isActive, source, sort_order AS sortOrder,
                 play_days AS playDays, result
          FROM markets
-         WHERE source = 'admin'
-         ORDER BY sort_order ASC, open_time ASC, name ASC`
+         WHERE id NOT LIKE 'starline-%'
+           AND id NOT LIKE 'jackpot-%'
+         ORDER BY
+           CASE source WHEN 'admin' THEN 0 WHEN 'scrape' THEN 1 ELSE 2 END,
+           sort_order ASC, open_time ASC, name ASC`
       );
       res.json({ ok: true, items: rows.map(mapRow) });
     } catch (err) {
@@ -136,7 +139,7 @@ router.get(
   }
 );
 
-/** Toggle play for admin-created market only */
+/** Toggle play for any market (scraped games included) */
 router.patch(
   '/:id/play',
   requireAuth,
@@ -152,13 +155,6 @@ router.patch(
       );
       if (!rows[0]) {
         return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
-      }
-      if (rows[0].source !== 'admin') {
-        return res.status(403).json({
-          ok: false,
-          error: 'NOT_ADMIN_MARKET',
-          message: 'Only admin-created games can be toggled here',
-        });
       }
 
       await query(`UPDATE markets SET is_active = :active WHERE id = :id`, {
@@ -391,6 +387,11 @@ router.post(
       const body = z
         .object({
           result: z.string().min(1).max(64),
+          session: z.enum(['open', 'close', 'full']).optional(),
+          date: z
+            .string()
+            .regex(/^\d{4}-\d{2}-\d{2}$/)
+            .optional(),
         })
         .parse(req.body);
 
@@ -403,14 +404,6 @@ router.post(
       if (!rows[0]) {
         return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
       }
-      if (rows[0].source !== 'admin') {
-        return res.status(403).json({
-          ok: false,
-          error: 'NOT_ADMIN_MARKET',
-          message:
-            'Only admin-created games can be declared here. Scraped markets get results automatically.',
-        });
-      }
 
       const out = await declareMarketResult({
         marketId: rows[0].id,
@@ -418,7 +411,39 @@ router.post(
         openTime: rows[0].openTime,
         closeTime: rows[0].closeTime,
         result: body.result,
-        source: 'admin',
+        source: rows[0].source,
+        session: body.session || 'full',
+        resultDate: body.date,
+      });
+      await bustCache();
+      res.json(out);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/:id/reverse-result',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const id = String(req.params.id);
+      const body = z
+        .object({
+          session: z.enum(['open', 'close']),
+          date: z
+            .string()
+            .regex(/^\d{4}-\d{2}-\d{2}$/)
+            .optional(),
+        })
+        .parse(req.body);
+
+      const out = await reverseMarketResult({
+        marketId: id,
+        session: body.session,
+        resultDate: body.date,
       });
       await bustCache();
       res.json(out);

@@ -49,6 +49,12 @@ function getFirebaseAdmin() {
   return firebaseAdmin;
 }
 
+function brandImageUrl() {
+  const base = String(config.publicBaseUrl || '').replace(/\/$/, '');
+  if (!base || /127\.0\.0\.1|localhost/i.test(base)) return '';
+  return `${base}/brand/sara555-logo.png`;
+}
+
 async function getActiveTokensForUser(userId) {
   const rows = await query(
     `SELECT token FROM device_tokens
@@ -107,8 +113,9 @@ async function sendToUser({
   const payload = {
     tokens,
     notification: {
-      title: title || 'SARA 567',
+      title: title || 'SARA 555',
       body: body || '',
+      ...(brandImageUrl() ? { imageUrl: brandImageUrl() } : {}),
     },
     data: stringData,
     android: {
@@ -116,6 +123,7 @@ async function sendToUser({
       notification: {
         channelId,
         sound: 'default',
+        ...(brandImageUrl() ? { imageUrl: brandImageUrl() } : {}),
       },
     },
     apns: {
@@ -304,8 +312,9 @@ async function sendToTokenList({
       const result = await admin.messaging().sendEachForMulticast({
         tokens: chunk,
         notification: {
-          title: title || 'SARA 567',
+          title: title || 'SARA 555',
           body: body || '',
+          ...(brandImageUrl() ? { imageUrl: brandImageUrl() } : {}),
         },
         data: stringData,
         android: {
@@ -313,6 +322,7 @@ async function sendToTokenList({
           notification: {
             channelId,
             sound: 'default',
+            ...(brandImageUrl() ? { imageUrl: brandImageUrl() } : {}),
           },
         },
         apns: {

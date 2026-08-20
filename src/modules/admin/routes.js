@@ -461,4 +461,6 @@ router.post(
   }
 );
 
+router.use('/dashboard', require('./dashboard'));
+
 module.exports = router;

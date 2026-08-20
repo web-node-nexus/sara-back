@@ -28,6 +28,8 @@ const adminSettingsRoutes = require('./modules/admin/settings');
 const adminSlotGameOnOffRoutes = require('./modules/admin/slotGameOnOff');
 const adminNoticesRoutes = require('./modules/admin/notices');
 const adminNotificationsRoutes = require('./modules/admin/notifications');
+const adminGameRatesRoutes = require('./modules/admin/gameRates');
+const adminDashboardRoutes = require('./modules/admin/dashboard');
 const notificationsRoutes = require('./modules/notifications/routes');
 const appPublicRoutes = require('./modules/app/routes');
 const mediaRoutes = require('./modules/media/routes');
@@ -98,6 +100,10 @@ function createApp() {
     '/uploads',
     express.static(path.join(__dirname, '../uploads'), { maxAge: '7d' })
   );
+  app.use(
+    '/brand',
+    express.static(path.join(__dirname, 'static/brand'), { maxAge: '30d' })
+  );
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true, service: 'sara567-api', ts: Date.now() });
@@ -119,6 +125,8 @@ function createApp() {
   app.use('/api/v1/jackpot', jackpotRoutes);
   app.use('/api/v1/chat', chatRoutes);
   app.use('/api/v1/admin', adminRoutes);
+  app.use('/api/v1/admin/dashboard', adminDashboardRoutes);
+  app.use('/api/v1/admin/game-rates', adminGameRatesRoutes);
   app.use('/api/v1/admin/markets', adminMarketsRoutes);
   app.use('/api/v1/admin/players', adminUsersRoutes);
   app.use('/api/v1/admin/reports', adminReportsRoutes);

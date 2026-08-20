@@ -2,8 +2,9 @@
  * Market scraper job
  *
  * - Updates live result/timing on matching DB markets (seed + admin kept as-is)
- * - Inserts NEW scrape-only markets (not already in DB)
- * - Does NOT hide seed/admin — user home shows scrape + DB merged
+ * - Inserts NEW scrape-only markets as OFF (admin must enable Game On/Off)
+ * - Never overwrites admin play ON/OFF on existing scrape rows
+ * - User home shows only is_active=1 markets
  *
  * Target URL: env SCRAPE_URL
  */
@@ -307,17 +308,17 @@ async function scrapeAndStore() {
         continue;
       }
 
-      // New or existing scrape row
+      // New scrape games stay OFF until admin enables them in Game On/Off.
+      // Existing rows keep whatever play flag the admin set.
       await query(
         `INSERT INTO markets
           (id, name, open_time, close_time, is_active, source, sort_order,
            result, scrape_timing, result_updated_at)
          VALUES
-          (:id, :name, :openTime, :closeTime, 1, 'scrape', :sort,
+          (:id, :name, :openTime, :closeTime, 0, 'scrape', :sort,
            :result, :timing, :now)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
-           is_active = 1,
            source = 'scrape',
            sort_order = VALUES(sort_order),
            result = VALUES(result),
@@ -340,27 +341,6 @@ async function scrapeAndStore() {
       upserted++;
     } catch (dbErr) {
       console.error(`[scraper] Upsert failed for ${id}:`, dbErr.message);
-    }
-  }
-
-  // Deactivate scrape-only markets missing from this run (never touch seed/admin)
-  if (scrapedIds.length) {
-    const named = {};
-    const keys = scrapedIds.map((id, i) => {
-      const k = `id${i}`;
-      named[k] = id;
-      return `:${k}`;
-    });
-    try {
-      await query(
-        `UPDATE markets
-         SET is_active = 0
-         WHERE source = 'scrape'
-           AND id NOT IN (${keys.join(',')})`,
-        named
-      );
-    } catch (e) {
-      console.warn('[scraper] stale deactivate skipped:', e.message);
     }
   }
 

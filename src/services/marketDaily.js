@@ -32,8 +32,9 @@ async function upsertMarketDaily({
   scrapeTiming,
   result,
   now = new Date(),
+  resultDate: dateOverride,
 }) {
-  const resultDate = istDateString(now);
+  const resultDate = dateOverride || istDateString(now);
   const nowSql = toMysqlDatetime(now);
   const resultVal = (result || '').trim() || null;
   const declared = isDeclaredResult(resultVal) ? 1 : 0;
