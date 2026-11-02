@@ -984,4 +984,453 @@ router.get(
   }
 );
 
+/**
+ * Play card — matka bids and wins by game type for one IST day.
+ * Amount is points; the count in parentheses is the number of bids / winning bids.
+ */
+router.get(
+  '/play-card',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          gameType: z.string().optional(),
+          marketId: z.string().optional(),
+          session: z.enum(['both', 'open', 'close', 'all']).optional(),
+        })
+        .parse(req.query);
+
+      const date = (q.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const marketId = String(q.marketId || '').trim();
+      const session = !q.session || q.session === 'all' ? 'both' : q.session;
+      const gameType = String(q.gameType || '').trim();
+      const typeFilter =
+        gameType && gameType.toLowerCase() !== 'all' ? gameType : '';
+
+      let sessionSql = '';
+      if (session === 'open') {
+        sessionSql = `AND (b.session = 'open' OR b.session IS NULL)`;
+      } else if (session === 'close') {
+        sessionSql = `AND b.session = 'close'`;
+      }
+
+      const rows = await query(
+        `SELECT b.game_id AS gameId,
+                MAX(b.game_name) AS gameName,
+                COUNT(*) AS bidCount,
+                COALESCE(SUM(b.points), 0) AS bidAmount,
+                COALESCE(SUM(CASE WHEN b.win_amount > 0 THEN 1 ELSE 0 END), 0) AS winCount,
+                COALESCE(SUM(b.win_amount), 0) AS winAmount
+         FROM bids b
+         WHERE b.status <> 'cancelled'
+           AND b.created_at >= :startSql
+           AND b.created_at < :endSql
+           AND b.market_id NOT LIKE 'starline-%'
+           AND b.market_id NOT LIKE 'jackpot-%'
+           AND (:marketId = '' OR b.market_id = :marketId)
+           ${sessionSql}
+         GROUP BY b.game_id`,
+        {
+          startSql: toMysqlDatetime(start),
+          endSql: toMysqlDatetime(end),
+          marketId,
+        }
+      );
+
+      const buckets = new Map();
+      for (const type of BID_REPORT_TYPES) {
+        buckets.set(type, {
+          type,
+          bidAmount: 0,
+          bidCount: 0,
+          winAmount: 0,
+          winCount: 0,
+        });
+      }
+      for (const row of rows) {
+        const type = reportTypeForBid(row.gameId, row.gameName);
+        if (typeFilter && type !== typeFilter) continue;
+        if (!buckets.has(type)) {
+          buckets.set(type, {
+            type,
+            bidAmount: 0,
+            bidCount: 0,
+            winAmount: 0,
+            winCount: 0,
+          });
+        }
+        const bucket = buckets.get(type);
+        bucket.bidAmount = money(bucket.bidAmount + money(row.bidAmount));
+        bucket.bidCount += Number(row.bidCount || 0);
+        bucket.winAmount = money(bucket.winAmount + money(row.winAmount));
+        bucket.winCount += Number(row.winCount || 0);
+      }
+
+      const items = BID_REPORT_TYPES.map((type) => buckets.get(type));
+      for (const [type, bucket] of buckets) {
+        if (!BID_REPORT_TYPES.includes(type)) items.push(bucket);
+      }
+      const total = items.reduce(
+        (sum, row) => ({
+          bidAmount: money(sum.bidAmount + row.bidAmount),
+          bidCount: sum.bidCount + row.bidCount,
+          winAmount: money(sum.winAmount + row.winAmount),
+          winCount: sum.winCount + row.winCount,
+        }),
+        { bidAmount: 0, bidCount: 0, winAmount: 0, winCount: 0 }
+      );
+
+      const markets = await query(
+        `SELECT id, name FROM markets
+         WHERE id NOT LIKE 'starline-%' AND id NOT LIKE 'jackpot-%'
+         ORDER BY sort_order, name`
+      );
+
+      res.json({
+        ok: true,
+        date,
+        session,
+        gameType: typeFilter || 'all',
+        marketId,
+        items,
+        total,
+        markets,
+        gameTypes: BID_REPORT_TYPES,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+const ADD_MONEY_TYPES = [
+  'all',
+  'upi',
+  'gateway',
+  'nxt',
+  'primepay',
+  'zakopay',
+  'imb',
+  'tpipay',
+  'webit',
+  'manually',
+];
+
+const GATEWAY_CHANNELS = ['nxt', 'primepay', 'zakopay', 'imb', 'tpipay', 'webit'];
+
+function addMoneyChannel(row) {
+  const ref = String(row.refType || '').toLowerCase();
+  const note = String(row.note || '').toLowerCase();
+  if (row.type === 'adjust') return 'manually';
+  if (ref === 'upi' || ref === 'upi_deposit') return 'upi';
+  if (ref === 'payment_order' || note.includes('imb')) return 'imb';
+  if (note.includes('nxt')) return 'nxt';
+  if (note.includes('primexpay') || note.includes('primepay')) return 'primepay';
+  if (note.includes('zakopay')) return 'zakopay';
+  if (note.includes('tpipay')) return 'tpipay';
+  if (note.includes('webit')) return 'webit';
+  if (row.type === 'deposit') return 'imb';
+  return 'manually';
+}
+
+function emptyAddSummary() {
+  return {
+    upi: 0,
+    manually: 0,
+    gateway: 0,
+    gatewayManually: 0,
+    gateways: {
+      nxt: 0,
+      primepay: 0,
+      zakopay: 0,
+      imb: 0,
+      tpipay: 0,
+      webit: 0,
+    },
+    total: 0,
+  };
+}
+
+/**
+ * Credits added to wallets on an IST day.
+ * Gateway = IMB payment orders. Manually = admin credit.
+ * Welcome bonus is excluded; it stays on the bonus card.
+ */
+router.get(
+  '/add-money',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          type: z.string().optional(),
+          mobile: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const date = (q.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const type = ADD_MONEY_TYPES.includes(String(q.type || 'all'))
+        ? String(q.type || 'all')
+        : 'all';
+      const mobile = String(q.mobile || '').replace(/\D/g, '').slice(0, 15);
+
+      const rows = await query(
+        `SELECT l.id, l.user_id AS userId, u.name, u.phone,
+                l.type, l.amount, l.balance_after AS balanceAfter,
+                l.note, l.ref_type AS refType, l.ref_id AS refId,
+                l.created_at AS createdAt
+         FROM wallet_ledger l
+         JOIN users u ON u.id = l.user_id
+         WHERE l.created_at >= :startSql
+           AND l.created_at < :endSql
+           AND (
+             (l.type = 'deposit' AND (l.ref_type IS NULL OR l.ref_type <> 'welcome_bonus'))
+             OR (l.type = 'adjust' AND l.amount > 0)
+           )
+           AND (:mobile = '' OR u.phone LIKE CONCAT('%', :mobile, '%'))
+         ORDER BY l.id DESC
+         LIMIT 400`,
+        {
+          startSql: toMysqlDatetime(start),
+          endSql: toMysqlDatetime(end),
+          mobile,
+        }
+      );
+
+      const summary = emptyAddSummary();
+      const classified = rows.map((row) => {
+        const amount = money(row.amount);
+        const channel = addMoneyChannel(row);
+        if (channel === 'upi') summary.upi = money(summary.upi + amount);
+        else if (channel === 'manually') {
+          summary.manually = money(summary.manually + amount);
+        } else if (GATEWAY_CHANNELS.includes(channel)) {
+          summary.gateways[channel] = money(summary.gateways[channel] + amount);
+          summary.gateway = money(summary.gateway + amount);
+        }
+        return {
+          id: row.id,
+          userId: row.userId,
+          name: row.name || 'User',
+          phone: row.phone || '',
+          amount,
+          balanceAfter: money(row.balanceAfter),
+          note: row.note || '',
+          channel,
+          createdAt: row.createdAt,
+        };
+      });
+
+      summary.total = money(
+        summary.upi + summary.manually + summary.gateway + summary.gatewayManually
+      );
+
+      const items =
+        type === 'all'
+          ? classified
+          : type === 'gateway'
+            ? classified.filter((row) => GATEWAY_CHANNELS.includes(row.channel))
+            : classified.filter((row) => row.channel === type);
+
+      res.json({
+        ok: true,
+        date,
+        type,
+        mobile,
+        records: items.length,
+        summary,
+        items,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+const WITHDRAW_TYPES = [
+  'all',
+  'auto',
+  'manual',
+  'nxt',
+  'primepay',
+  'zakopay',
+  'imb',
+  'tpipay',
+];
+
+function withdrawChannel(row) {
+  const payout = String(row.payoutStatus || '');
+  if (payout.toLowerCase() === 'manual') return 'manual';
+  const note = `${row.note || ''} ${row.bankName || ''}`.toLowerCase();
+  if (note.includes('nxt')) return 'nxt';
+  if (note.includes('primexpay') || note.includes('primepay')) return 'primepay';
+  if (note.includes('zakopay')) return 'zakopay';
+  if (note.includes('tpipay')) return 'tpipay';
+  return 'imb';
+}
+
+/**
+ * Approved / paid withdrawals for an IST day.
+ * Manual = Accept With Bank. Auto = gateway payout. Live gateway is IMB.
+ */
+router.get(
+  '/withdraw-money',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          type: z.string().optional(),
+          mobile: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const date = (q.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const type = WITHDRAW_TYPES.includes(String(q.type || 'all'))
+        ? String(q.type || 'all')
+        : 'all';
+      const mobile = String(q.mobile || '').replace(/\D/g, '').slice(0, 15);
+
+      const rows = await query(
+        `SELECT w.id, w.user_id AS userId, u.name, u.phone, w.amount, w.status,
+                w.note, w.payout_status AS payoutStatus, w.payout_txn_id AS payoutTxnId,
+                w.bank_name AS bankName, w.upi_id AS upiId,
+                w.account_name AS accountName, w.created_at AS createdAt
+         FROM withdraw_requests w
+         JOIN users u ON u.id = w.user_id
+         WHERE w.status IN ('approved', 'paid')
+           AND w.created_at >= :startSql
+           AND w.created_at < :endSql
+           AND (:mobile = '' OR u.phone LIKE CONCAT('%', :mobile, '%'))
+         ORDER BY w.id DESC
+         LIMIT 400`,
+        {
+          startSql: toMysqlDatetime(start),
+          endSql: toMysqlDatetime(end),
+          mobile,
+        }
+      );
+
+      const summary = {
+        approved: 0,
+        approvedCount: 0,
+        auto: 0,
+        autoCount: 0,
+        manual: 0,
+        manualCount: 0,
+        gateways: { nxt: 0, primepay: 0, zakopay: 0, imb: 0, tpipay: 0 },
+      };
+
+      const classified = rows.map((row) => {
+        const amount = money(row.amount);
+        const channel = withdrawChannel(row);
+        const mode = channel === 'manual' ? 'manual' : 'auto';
+        summary.approved = money(summary.approved + amount);
+        summary.approvedCount += 1;
+        if (mode === 'manual') {
+          summary.manual = money(summary.manual + amount);
+          summary.manualCount += 1;
+        } else {
+          summary.auto = money(summary.auto + amount);
+          summary.autoCount += 1;
+          if (summary.gateways[channel] != null) {
+            summary.gateways[channel] = money(summary.gateways[channel] + amount);
+          }
+        }
+        return {
+          id: row.id,
+          userId: row.userId,
+          name: row.name || 'User',
+          phone: row.phone || '',
+          amount,
+          status: row.status,
+          mode,
+          channel,
+          note: row.note || '',
+          upiId: row.upiId || null,
+          accountName: row.accountName || null,
+          bankName: row.bankName || null,
+          payoutTxnId: row.payoutTxnId || null,
+          createdAt: row.createdAt,
+        };
+      });
+
+      const items = classified.filter((row) => {
+        if (type === 'all') return true;
+        if (type === 'auto') return row.mode === 'auto';
+        if (type === 'manual') return row.mode === 'manual';
+        return row.channel === type;
+      });
+
+      res.json({
+        ok: true,
+        date,
+        type,
+        mobile,
+        status: 'approved',
+        records: items.length,
+        summary,
+        items,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/** Rejected withdraw requests for an IST day. Amount was refunded to the wallet. */
+router.get(
+  '/rejected-money',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const date = String(req.query.date || istDateString()).slice(0, 10);
+      const { start, end } = istDayBounds(date);
+      const rows = await query(
+        `SELECT w.id, w.user_id AS userId, u.name, u.phone, w.amount,
+                w.note, w.upi_id AS upiId, w.account_name AS accountName,
+                w.bank_name AS bankName, w.created_at AS createdAt
+         FROM withdraw_requests w
+         JOIN users u ON u.id = w.user_id
+         WHERE w.status = 'rejected'
+           AND w.created_at >= :startSql
+           AND w.created_at < :endSql
+         ORDER BY w.id DESC
+         LIMIT 400`,
+        {
+          startSql: toMysqlDatetime(start),
+          endSql: toMysqlDatetime(end),
+        }
+      );
+      const items = rows.map((row) => ({
+        id: row.id,
+        userId: row.userId,
+        name: row.name || 'User',
+        phone: row.phone || '',
+        amount: money(row.amount),
+        note: row.note || '',
+        upiId: row.upiId || null,
+        accountName: row.accountName || null,
+        bankName: row.bankName || null,
+        createdAt: row.createdAt,
+      }));
+      const total = items.reduce((sum, row) => money(sum + row.amount), 0);
+      res.json({ ok: true, date, total, records: items.length, items });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 module.exports = router;

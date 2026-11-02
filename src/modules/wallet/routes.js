@@ -210,6 +210,87 @@ router.get(
   }
 );
 
+router.get('/payment-methods', requireAuth, requireRole('player'), async (req, res, next) => {
+  try {
+    const rows = await query(
+      `SELECT id, type, label, bank_name AS bankName, account_name AS accountName,
+              account_number AS accountNumber, ifsc, upi_id AS upiId
+       FROM user_payment_methods
+       WHERE user_id = :userId
+       ORDER BY id DESC`,
+      { userId: req.user.id }
+    );
+    res.json({ ok: true, items: rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/payment-methods', requireAuth, requireRole('player'), async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        type: z.enum(['bank', 'upi']),
+        bankName: z.string().max(120).optional(),
+        accountName: z.string().max(120).optional(),
+        accountNumber: z.string().max(40).optional(),
+        ifsc: z.string().max(20).optional(),
+        upiId: z.string().max(120).optional(),
+        label: z.string().max(120).optional(),
+      })
+      .parse(req.body);
+
+    if (body.type === 'bank') {
+      if (!body.accountNumber || !body.ifsc || !body.accountName) {
+        return res.status(400).json({
+          ok: false,
+          error: 'BANK_REQUIRED',
+          message: 'Account name, number and IFSC required',
+        });
+      }
+    } else if (!body.upiId || !body.accountName) {
+      return res.status(400).json({
+        ok: false,
+        error: 'UPI_REQUIRED',
+        message: 'Name and UPI ID required',
+      });
+    }
+
+    const result = await query(
+      `INSERT INTO user_payment_methods
+        (user_id, type, label, bank_name, account_name, account_number, ifsc, upi_id)
+       VALUES
+        (:userId, :type, :label, :bankName, :accountName, :accountNumber, :ifsc, :upiId)`,
+      {
+        userId: req.user.id,
+        type: body.type,
+        label: body.label || body.bankName || body.upiId || null,
+        bankName: body.bankName || null,
+        accountName: body.accountName || null,
+        accountNumber: body.accountNumber || null,
+        ifsc: body.ifsc ? body.ifsc.toUpperCase() : null,
+        upiId: body.upiId || null,
+      }
+    );
+
+    res.status(201).json({
+      ok: true,
+      item: {
+        id: result.insertId,
+        type: body.type,
+        label: body.label || body.bankName || body.upiId || null,
+        bankName: body.bankName || null,
+        accountName: body.accountName || null,
+        accountNumber: body.accountNumber || null,
+        ifsc: body.ifsc ? body.ifsc.toUpperCase() : null,
+        upiId: body.upiId || null,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/withdraw/eligibility', requireAuth, requireRole('player'), async (req, res, next) => {
   try {
     const settings = await getAppSettings();

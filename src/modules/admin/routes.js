@@ -253,34 +253,85 @@ router.get(
   requireRole('admin', 'provider'),
   async (req, res, next) => {
     try {
+      const allowed = ['pending', 'processing', 'approved', 'paid', 'rejected'];
       const status = String(req.query.status || 'pending');
       const statuses =
         status === 'all'
-          ? ['pending', 'processing', 'approved', 'paid', 'rejected']
+          ? allowed
           : status === 'open'
             ? ['pending', 'processing']
             : [status];
+      const safe = statuses.filter((s) => allowed.includes(s));
+      if (!safe.length) {
+        return res.status(400).json({ ok: false, error: 'BAD_STATUS' });
+      }
       const named = {};
-      const keys = statuses.map((s, i) => {
+      const keys = safe.map((s, i) => {
         const k = `s${i}`;
         named[k] = s;
         return `:${k}`;
       });
+      let where = `w.status IN (${keys.join(',')})`;
+      const q = String(req.query.q || '').trim();
+      if (q) {
+        named.q = `%${q}%`;
+        where += ` AND (u.name LIKE :q OR u.phone LIKE :q)`;
+      }
+      const date = String(req.query.date || '').trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        const from = new Date(`${date}T00:00:00+05:30`);
+        named.from = from;
+        named.to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
+        where += ` AND w.created_at >= :from AND w.created_at < :to`;
+      }
       const rows = await query(
         `SELECT w.id, w.user_id AS userId, w.amount, w.status, w.note,
+                w.admin_remark AS adminRemark,
                 w.upi_id AS upiId, w.account_name AS accountName,
                 w.account_number AS accountNumber, w.ifsc, w.bank_name AS bankName,
                 w.client_ref_id AS clientRefId, w.payout_txn_id AS payoutTxnId,
                 w.payout_status AS payoutStatus,
-                w.created_at AS createdAt, u.name AS userName, u.phone
+                w.created_at AS createdAt, u.name AS userName, u.phone,
+                wal.balance AS walletBalance
          FROM withdraw_requests w
          JOIN users u ON u.id = w.user_id
-         WHERE w.status IN (${keys.join(',')})
+         LEFT JOIN wallets wal ON wal.user_id = w.user_id
+         WHERE ${where}
          ORDER BY w.id DESC
-         LIMIT 100`,
+         LIMIT 200`,
         named
       );
-      res.json({ ok: true, items: rows });
+      const items = rows.map((row) => {
+        const upiId = row.upiId || null;
+        return {
+          ...row,
+          amount: Number(row.amount),
+          walletBalance: Number(row.walletBalance || 0),
+          payoutType: upiId ? 'upi' : 'bank',
+          upiApp: upiId ? row.bankName || 'UPI' : null,
+        };
+      });
+      const totalAmount = items.reduce((sum, row) => sum + row.amount, 0);
+      res.json({ ok: true, items, totalAmount });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/withdraws/:id/remark',
+  requireAuth,
+  requireRole('admin', 'provider'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const remark = z.string().max(255).parse(req.body?.remark ?? '');
+      await query(
+        `UPDATE withdraw_requests SET admin_remark = :remark WHERE id = :id`,
+        { id, remark: remark.trim() || null }
+      );
+      res.json({ ok: true });
     } catch (err) {
       next(err);
     }
@@ -295,8 +346,42 @@ router.post(
     try {
       const id = Number(req.params.id);
       const body = z
-        .object({ decision: z.enum(['approved', 'rejected']) })
+        .object({ decision: z.enum(['approved', 'rejected', 'manual']) })
         .parse(req.body);
+
+      if (body.decision === 'manual') {
+        const out = await withTransaction(async (conn) => {
+          const [rows] = await conn.execute(
+            `SELECT * FROM withdraw_requests WHERE id = ? FOR UPDATE`,
+            [id]
+          );
+          const wr = rows[0];
+          if (!wr || wr.status !== 'pending') {
+            const err = new Error('Not found or already decided');
+            err.status = 404;
+            throw err;
+          }
+          await conn.execute(
+            `UPDATE withdraw_requests
+             SET status = 'paid', payout_status = 'Manual'
+             WHERE id = ?`,
+            [id]
+          );
+          return { userId: wr.user_id, amount: wr.amount };
+        });
+        const users = await query(
+          `SELECT name FROM users WHERE id = :id LIMIT 1`,
+          { id: out.userId }
+        );
+        const userName = users[0]?.name || 'User';
+        notifySystemEventAsync({
+          userId: out.userId,
+          kind: 'withdraw',
+          title: 'Withdrawal Approved',
+          message: `Dear ${userName}, Your withdrawal request of Rs.${Number(out.amount).toLocaleString('en-IN')} has been accepted.`,
+        });
+        return res.json({ ok: true, status: 'paid' });
+      }
 
       if (body.decision === 'rejected') {
         const out = await withTransaction(async (conn) => {
