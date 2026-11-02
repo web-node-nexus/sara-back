@@ -1,6 +1,7 @@
 const express = require('express');
 const { z } = require('zod');
-const { query } = require('../../config/db');
+const { query, withTransaction } = require('../../config/db');
+const cache = require('../../config/redis');
 const { requireAuth, requireRole } = require('../../middleware/auth');
 const {
   istDateString,
@@ -1427,6 +1428,206 @@ router.get(
       }));
       const total = items.reduce((sum, row) => money(sum + row.amount), 0);
       res.json({ ok: true, date, total, records: items.length, items });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+/**
+ * One user's bids for a market/day, grouped for the User Bid Update screen.
+ * All filters are required. Pending bids can be edited; points adjust the wallet.
+ */
+router.get(
+  '/user-bid-update',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().min(10),
+          gameType: z.string().min(1),
+          marketId: z.string().min(1),
+          session: z.enum(['both', 'open', 'close']),
+          phone: z.string().min(10),
+        })
+        .parse(req.query);
+
+      const date = q.date.slice(0, 10);
+      const digits = q.phone.replace(/\D/g, '').slice(-10);
+      if (digits.length !== 10) {
+        return res.status(400).json({
+          ok: false,
+          error: 'INVALID_PHONE',
+          message: 'Enter a 10-digit mobile number',
+        });
+      }
+
+      const users = await query(
+        `SELECT id, name, phone
+         FROM users
+         WHERE role = 'player'
+           AND RIGHT(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '+', ''), 10) = :digits
+         ORDER BY id ASC
+         LIMIT 1`,
+        { digits }
+      );
+      const player = users[0];
+      if (!player) {
+        return res.status(404).json({
+          ok: false,
+          error: 'USER_NOT_FOUND',
+          message: 'No user found for this mobile number',
+        });
+      }
+
+      const { start, end } = istDayBounds(date);
+      let sessionSql = '';
+      if (q.session === 'open') {
+        sessionSql = `AND (b.session = 'open' OR b.session IS NULL)`;
+      } else if (q.session === 'close') {
+        sessionSql = `AND b.session = 'close'`;
+      }
+
+      const rows = await query(
+        `SELECT b.id, b.game_id AS gameId, b.game_name AS gameName,
+                b.number_value AS number, b.points, b.session, b.status,
+                b.created_at AS createdAt
+         FROM bids b
+         WHERE b.user_id = :userId
+           AND b.market_id = :marketId
+           AND b.status <> 'cancelled'
+           AND b.created_at >= :startSql
+           AND b.created_at < :endSql
+           ${sessionSql}
+         ORDER BY b.id ASC`,
+        {
+          userId: player.id,
+          marketId: q.marketId,
+          startSql: toMysqlDatetime(start),
+          endSql: toMysqlDatetime(end),
+        }
+      );
+
+      const buckets = new Map(
+        BID_REPORT_TYPES.map((type) => [type, []])
+      );
+      for (const row of rows) {
+        const type = reportTypeForBid(row.gameId, row.gameName);
+        if (!buckets.has(type)) buckets.set(type, []);
+        buckets.get(type).push({
+          id: Number(row.id),
+          gameId: row.gameId,
+          gameName: row.gameName,
+          number: row.number,
+          points: money(row.points),
+          session: row.session === 'close' ? 'close' : 'open',
+          status: row.status,
+          createdAt: row.createdAt,
+        });
+      }
+
+      const groups = [...buckets.entries()].map(([type, bids]) => ({
+        type,
+        bids,
+      }));
+
+      res.json({
+        ok: true,
+        date,
+        gameType: q.gameType,
+        user: {
+          id: player.id,
+          name: player.name,
+          phone: player.phone,
+        },
+        groups,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.patch(
+  '/user-bid-update/:id',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const body = z
+        .object({
+          number: z.string().min(1).max(32),
+          points: z.number().positive().max(100000),
+        })
+        .parse(req.body);
+      const number = body.number.trim();
+      const points = Math.round(body.points * 100) / 100;
+
+      const updated = await withTransaction(async (conn) => {
+        const [rows] = await conn.execute(
+          `SELECT id, user_id AS userId, points, status
+           FROM bids WHERE id = ? LIMIT 1 FOR UPDATE`,
+          [id]
+        );
+        const bid = rows[0];
+        if (!bid) {
+          const err = new Error('Bid not found');
+          err.status = 404;
+          throw err;
+        }
+        if (bid.status !== 'pending') {
+          const err = new Error('Only pending bids can be updated');
+          err.status = 400;
+          throw err;
+        }
+        const oldPoints = Number(bid.points);
+        const delta = Math.round((points - oldPoints) * 100) / 100;
+        const [wallets] = await conn.execute(
+          `SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE`,
+          [bid.userId]
+        );
+        if (!wallets[0]) {
+          const err = new Error('Wallet not found');
+          err.status = 400;
+          throw err;
+        }
+        let balance = Number(wallets[0].balance);
+        if (delta > 0 && balance + 0.001 < delta) {
+          const err = new Error('Insufficient wallet balance');
+          err.status = 400;
+          throw err;
+        }
+        if (delta !== 0) {
+          balance = Math.round((balance - delta) * 100) / 100;
+          await conn.execute(
+            `UPDATE wallets SET balance = ?, version = version + 1 WHERE user_id = ?`,
+            [balance, bid.userId]
+          );
+          await conn.execute(
+            `INSERT INTO wallet_ledger
+              (user_id, type, amount, balance_after, note, ref_type)
+             VALUES (?, 'adjust', ?, ?, ?, 'bid_update')`,
+            [bid.userId, -delta, balance, `Bid update #${id}`]
+          );
+        }
+        await conn.execute(
+          `UPDATE bids SET number_value = ?, points = ? WHERE id = ?`,
+          [number, points, id]
+        );
+        return {
+          userId: Number(bid.userId),
+          id,
+          number,
+          points,
+          balance,
+        };
+      });
+
+      await cache.del(`wallet:${updated.userId}`);
+      res.json({ ok: true, bid: updated });
     } catch (err) {
       next(err);
     }
