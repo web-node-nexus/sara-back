@@ -218,12 +218,23 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res, next) => {
     const todayBounds = istDayBounds(today);
     const todayStart = toMysqlDatetime(todayBounds.start);
     const todayEnd = toMysqlDatetime(todayBounds.end);
+    const isDay = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''));
+    let pnlFrom = isDay(req.query.pnlFrom) ? String(req.query.pnlFrom).slice(0, 10) : date;
+    let pnlTo = isDay(req.query.pnlTo) ? String(req.query.pnlTo).slice(0, 10) : pnlFrom;
+    if (pnlFrom > pnlTo) {
+      const swap = pnlFrom;
+      pnlFrom = pnlTo;
+      pnlTo = swap;
+    }
+    const pnlStart = toMysqlDatetime(istDayBounds(pnlFrom).start);
+    const pnlEnd = toMysqlDatetime(istDayBounds(pnlTo).end);
 
     const [
       settings,
       kpiRows,
       scopedBids,
       scopedMoney,
+      pnlMoney,
       todayMoney,
       lifetimeMoney,
       top,
@@ -240,6 +251,7 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res, next) => {
       ),
       bidKindSums(dayStart, dayEnd),
       moneyBreakdown(dayStart, dayEnd),
+      moneyBreakdown(pnlStart, pnlEnd),
       moneyBreakdown(todayStart, todayEnd),
       moneyBreakdown(null, null),
       topPerformers(dayStart, dayEnd),
@@ -265,7 +277,9 @@ router.get('/', requireAuth, requireRole('admin'), async (req, res, next) => {
       rejectMoney: scopedMoney.rejectMoney,
       bonus: scopedMoney.bonus,
       pnl: {
-        date: scopedMoney.pnl,
+        date: pnlMoney.pnl,
+        from: pnlFrom,
+        to: pnlTo,
         today: todayMoney.pnl,
         lifetime: lifetimeMoney.pnl,
       },
