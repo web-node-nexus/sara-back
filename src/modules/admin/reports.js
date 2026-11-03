@@ -1634,4 +1634,258 @@ router.patch(
   }
 );
 
+/**
+ * Game Cancel — list pending matka bids for a day, cancel selected (refund wallet),
+ * and history of cancelled bids.
+ */
+router.get(
+  '/game-cancel',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          marketId: z.string().optional(),
+          session: z.enum(['both', 'open', 'close', 'all']).optional(),
+          search: z.string().optional(),
+        })
+        .parse(req.query);
+
+      const date = String(q.date || istDateString()).slice(0, 10);
+      const marketId = String(q.marketId || '').trim();
+      const session = q.session === 'all' ? 'both' : q.session || 'both';
+      const search = String(q.search || '').trim();
+      const { start, end } = istDayBounds(date);
+
+      let sessionSql = '';
+      if (session === 'open') {
+        sessionSql = `AND (b.session = 'open' OR b.session IS NULL)`;
+      } else if (session === 'close') {
+        sessionSql = `AND b.session = 'close'`;
+      }
+
+      const params = {
+        startSql: toMysqlDatetime(start),
+        endSql: toMysqlDatetime(end),
+        marketId,
+        search,
+      };
+
+      const rows = await query(
+        `SELECT b.id, b.user_id AS userId, u.name AS userName, u.phone,
+                b.market_id AS marketId, b.market_name AS marketName,
+                b.game_id AS gameId, b.game_name AS gameName,
+                b.number_value AS number, b.points, b.session, b.status,
+                b.created_at AS createdAt
+         FROM bids b
+         INNER JOIN users u ON u.id = b.user_id
+         WHERE b.status = 'pending'
+           AND b.market_id NOT LIKE 'starline-%'
+           AND b.market_id NOT LIKE 'jackpot-%'
+           AND b.created_at >= :startSql
+           AND b.created_at < :endSql
+           AND (:marketId = '' OR b.market_id = :marketId)
+           AND (
+             :search = ''
+             OR u.name LIKE CONCAT('%', :search, '%')
+             OR u.phone LIKE CONCAT('%', :search, '%')
+             OR u.login_id LIKE CONCAT('%', :search, '%')
+           )
+           ${sessionSql}
+         ORDER BY b.id DESC
+         LIMIT 500`,
+        params
+      );
+
+      const markets = await query(
+        `SELECT id, name FROM markets
+         WHERE id NOT LIKE 'starline-%'
+           AND id NOT LIKE 'jackpot-%'
+         ORDER BY sort_order ASC, name ASC`
+      );
+
+      const items = (rows || []).map((row) => ({
+        id: Number(row.id),
+        userId: Number(row.userId),
+        userName: row.userName || 'User',
+        phone: row.phone || '',
+        marketId: row.marketId,
+        marketName: row.marketName,
+        gameId: row.gameId,
+        gameName: row.gameName,
+        number: row.number,
+        points: money(row.points),
+        session: row.session === 'close' ? 'close' : 'open',
+        status: row.status,
+        createdAt: row.createdAt,
+      }));
+
+      res.json({
+        ok: true,
+        date,
+        filters: { marketId, session, search },
+        markets: (markets || []).map((m) => ({ id: m.id, name: m.name })),
+        items,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/game-cancel',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const body = z
+        .object({
+          ids: z.array(z.number().int().positive()).min(1).max(200),
+        })
+        .parse(req.body);
+
+      const ids = [...new Set(body.ids.map(Number))];
+      const result = await withTransaction(async (conn) => {
+        const placeholders = ids.map(() => '?').join(',');
+        const [rows] = await conn.execute(
+          `SELECT id, user_id AS userId, points, status
+           FROM bids
+           WHERE id IN (${placeholders})
+           FOR UPDATE`,
+          ids
+        );
+        let cancelled = 0;
+        let refunded = 0;
+        const touchedUsers = new Set();
+
+        for (const bid of rows || []) {
+          if (bid.status !== 'pending') continue;
+          const points = Number(bid.points || 0);
+          const [wallets] = await conn.execute(
+            `SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE`,
+            [bid.userId]
+          );
+          if (!wallets[0]) {
+            await conn.execute(
+              `INSERT INTO wallets (user_id, balance) VALUES (?, 0)`,
+              [bid.userId]
+            );
+          }
+          const [again] = await conn.execute(
+            `SELECT balance FROM wallets WHERE user_id = ? FOR UPDATE`,
+            [bid.userId]
+          );
+          const balance = Math.round((Number(again[0].balance) + points) * 100) / 100;
+          await conn.execute(
+            `UPDATE wallets SET balance = ?, version = version + 1 WHERE user_id = ?`,
+            [balance, bid.userId]
+          );
+          await conn.execute(
+            `INSERT INTO wallet_ledger
+              (user_id, type, amount, balance_after, note, ref_type, ref_id)
+             VALUES (?, 'adjust', ?, ?, ?, 'game_cancel', ?)`,
+            [
+              bid.userId,
+              points,
+              balance,
+              `Game cancel refund #${bid.id}`,
+              String(bid.id),
+            ]
+          );
+          const [upd] = await conn.execute(
+            `UPDATE bids SET status = 'cancelled' WHERE id = ? AND status = 'pending'`,
+            [bid.id]
+          );
+          if (upd.affectedRows) {
+            cancelled += 1;
+            refunded += points;
+            touchedUsers.add(Number(bid.userId));
+          }
+        }
+
+        return {
+          cancelled,
+          refunded: money(refunded),
+          userIds: [...touchedUsers],
+        };
+      });
+
+      for (const userId of result.userIds) {
+        await cache.del(`wallet:${userId}`);
+      }
+
+      res.json({
+        ok: true,
+        cancelled: result.cancelled,
+        refunded: result.refunded,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.get(
+  '/game-cancel/history',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const q = z
+        .object({
+          date: z.string().optional(),
+          search: z.string().optional(),
+        })
+        .parse(req.query);
+      const date = String(q.date || istDateString()).slice(0, 10);
+      const search = String(q.search || '').trim();
+      const { start, end } = istDayBounds(date);
+
+      const rows = await query(
+        `SELECT b.id, b.user_id AS userId, u.name AS userName, u.phone,
+                b.market_name AS marketName, b.game_name AS gameName,
+                b.number_value AS number, b.points, b.session,
+                b.created_at AS createdAt
+         FROM bids b
+         INNER JOIN users u ON u.id = b.user_id
+         WHERE b.status = 'cancelled'
+           AND b.created_at >= :startSql
+           AND b.created_at < :endSql
+           AND (
+             :search = ''
+             OR u.name LIKE CONCAT('%', :search, '%')
+             OR u.phone LIKE CONCAT('%', :search, '%')
+           )
+         ORDER BY b.id DESC
+         LIMIT 500`,
+        {
+          startSql: toMysqlDatetime(start),
+          endSql: toMysqlDatetime(end),
+          search,
+        }
+      );
+
+      const items = (rows || []).map((row) => ({
+        id: Number(row.id),
+        userId: Number(row.userId),
+        userName: row.userName || 'User',
+        phone: row.phone || '',
+        marketName: row.marketName,
+        gameName: row.gameName,
+        number: row.number,
+        points: money(row.points),
+        session: row.session === 'close' ? 'close' : 'open',
+        createdAt: row.createdAt,
+      }));
+
+      res.json({ ok: true, date, items });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 module.exports = router;
