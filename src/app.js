@@ -129,6 +129,7 @@ function createApp() {
   app.use('/api/v1/admin/game-rates', adminGameRatesRoutes);
   app.use('/api/v1/admin/markets', adminMarketsRoutes);
   app.use('/api/v1/admin/players', adminUsersRoutes);
+  app.use('/api/v1/admin/staff', require('./modules/admin/staff'));
   app.use('/api/v1/admin/reports', adminReportsRoutes);
   app.use('/api/v1/admin/deposit-calls', adminDepositCallsRoutes);
   app.use('/api/v1/admin/withdraw-calls', adminWithdrawCallsRoutes);

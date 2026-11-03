@@ -35,6 +35,32 @@ async function issueTokens(user) {
   return { accessToken, refreshToken };
 }
 
+async function enrichAdminUser(user) {
+  const base = {
+    id: user.id,
+    loginId: user.login_id || user.loginId,
+    name: user.name,
+    role: user.role,
+    phone: user.phone,
+  };
+  if (user.role !== 'admin') return base;
+  try {
+    const { loadScreens, ADMIN_SCREEN_KEYS } = require('../admin/staff');
+    const rows = await query(
+      `SELECT COALESCE(is_superadmin, 0) AS isSuperadmin
+       FROM users WHERE id = :id LIMIT 1`,
+      { id: user.id }
+    );
+    const isSuperadmin = !!Number(rows[0]?.isSuperadmin);
+    const screens = isSuperadmin
+      ? ADMIN_SCREEN_KEYS
+      : await loadScreens(user.id);
+    return { ...base, isSuperadmin, screens };
+  } catch {
+    return { ...base, isSuperadmin: false, screens: [] };
+  }
+}
+
 function publicUser(user) {
   return {
     id: user.id,
@@ -422,7 +448,11 @@ router.post('/login', async (req, res, next) => {
       return res.status(401).json({ ok: false, error: 'INVALID_CREDENTIALS' });
     }
     const tokens = await issueTokens(user);
-    res.json({ ok: true, user: publicUser(user), ...tokens });
+    const profile =
+      user.role === 'admin'
+        ? await enrichAdminUser(user)
+        : publicUser(user);
+    res.json({ ok: true, user: profile, ...tokens });
   } catch (err) {
     next(err);
   }
@@ -494,14 +524,26 @@ router.post('/logout', requireAuth, async (req, res, next) => {
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
     const rows = await query(
-      `SELECT id, login_id AS loginId, name, role, phone, status
+      `SELECT id, login_id, name, role, phone, status,
+              COALESCE(is_superadmin, 0) AS is_superadmin
        FROM users WHERE id = :id LIMIT 1`,
       { id: req.user.id }
     );
     if (!rows[0]) {
       return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
     }
-    res.json({ ok: true, user: rows[0] });
+    const user =
+      rows[0].role === 'admin'
+        ? await enrichAdminUser(rows[0])
+        : {
+            id: rows[0].id,
+            loginId: rows[0].login_id,
+            name: rows[0].name,
+            role: rows[0].role,
+            phone: rows[0].phone,
+            status: rows[0].status,
+          };
+    res.json({ ok: true, user });
   } catch (err) {
     next(err);
   }
