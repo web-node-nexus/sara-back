@@ -1888,4 +1888,151 @@ router.get(
   }
 );
 
+/**
+ * Wallet Amount destination — user registration + play-active stats.
+ * date: day badge / play active for that IST day
+ * month+year: month registration count
+ */
+router.get(
+  '/wallet-users',
+  requireAuth,
+  requireRole('admin'),
+  async (req, res, next) => {
+    try {
+      const today = istDateString();
+      const date = String(req.query.date || today).slice(0, 10);
+      let year = Number(req.query.year) || Number(date.slice(0, 4));
+      let month = Number(req.query.month) || Number(date.slice(5, 7));
+      if (!Number.isFinite(year) || year < 2000 || year > 2100) {
+        year = Number(today.slice(0, 4));
+      }
+      if (!Number.isFinite(month) || month < 1 || month > 12) {
+        month = Number(today.slice(5, 7));
+      }
+
+      const dayBounds = istDayBounds(date);
+      const yesterday = new Date(dayBounds.start.getTime() - 24 * 60 * 60 * 1000);
+      const yesterdayStr = istDateString(yesterday);
+      const yBounds = istDayBounds(yesterdayStr);
+
+      // Current IST week: Monday 00:00 → next Monday
+      const todayBounds = istDayBounds(today);
+      const [ty, tm, td] = today.split('-').map(Number);
+      const istWeekday = new Date(Date.UTC(ty, tm - 1, td, 6, 30)).getUTCDay(); // IST noon
+      const weekday = (istWeekday + 6) % 7; // Mon=0 … Sun=6
+      const weekStart = new Date(
+        todayBounds.start.getTime() - weekday * 24 * 60 * 60 * 1000
+      );
+      const weekEnd = new Date(weekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+      const monthPad = String(month).padStart(2, '0');
+      const monthStart = new Date(`${year}-${monthPad}-01T00:00:00+05:30`);
+      const nextMonth =
+        month === 12
+          ? new Date(`${year + 1}-01-01T00:00:00+05:30`)
+          : new Date(
+              `${year}-${String(month + 1).padStart(2, '0')}-01T00:00:00+05:30`
+            );
+
+      const [
+        totalRows,
+        todayRows,
+        yesterdayRows,
+        weekRows,
+        dayRegRows,
+        monthRegRows,
+        playActiveRows,
+        walletRows,
+      ] = await Promise.all([
+        query(
+          `SELECT COUNT(*) AS total FROM users WHERE role = 'player'`
+        ),
+        query(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE role = 'player'
+             AND created_at >= :start AND created_at < :end`,
+          {
+            start: toMysqlDatetime(todayBounds.start),
+            end: toMysqlDatetime(todayBounds.end),
+          }
+        ),
+        query(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE role = 'player'
+             AND created_at >= :start AND created_at < :end`,
+          {
+            start: toMysqlDatetime(yBounds.start),
+            end: toMysqlDatetime(yBounds.end),
+          }
+        ),
+        query(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE role = 'player'
+             AND created_at >= :start AND created_at < :end`,
+          {
+            start: toMysqlDatetime(weekStart),
+            end: toMysqlDatetime(weekEnd),
+          }
+        ),
+        query(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE role = 'player'
+             AND created_at >= :start AND created_at < :end`,
+          {
+            start: toMysqlDatetime(dayBounds.start),
+            end: toMysqlDatetime(dayBounds.end),
+          }
+        ),
+        query(
+          `SELECT COUNT(*) AS total FROM users
+           WHERE role = 'player'
+             AND created_at >= :start AND created_at < :end`,
+          {
+            start: toMysqlDatetime(monthStart),
+            end: toMysqlDatetime(nextMonth),
+          }
+        ),
+        query(
+          `SELECT COUNT(DISTINCT b.user_id) AS total
+           FROM bids b
+           INNER JOIN users u ON u.id = b.user_id AND u.role = 'player'
+           WHERE b.status <> 'cancelled'
+             AND b.created_at >= :start AND b.created_at < :end`,
+          {
+            start: toMysqlDatetime(dayBounds.start),
+            end: toMysqlDatetime(dayBounds.end),
+          }
+        ),
+        query(
+          `SELECT COALESCE(SUM(w.balance), 0) AS total
+           FROM wallets w
+           INNER JOIN users u ON u.id = w.user_id AND u.role = 'player'`
+        ),
+      ]);
+
+      const totalUsers = Number(totalRows[0]?.total || 0);
+      const playActive = Number(playActiveRows[0]?.total || 0);
+      const playInactive = Math.max(0, totalUsers - playActive);
+
+      res.json({
+        ok: true,
+        date,
+        month,
+        year,
+        totalUsers,
+        todayRegister: Number(todayRows[0]?.total || 0),
+        yesterdayRegister: Number(yesterdayRows[0]?.total || 0),
+        currentWeek: Number(weekRows[0]?.total || 0),
+        dayRegister: Number(dayRegRows[0]?.total || 0),
+        monthRegister: Number(monthRegRows[0]?.total || 0),
+        playActive,
+        playInactive,
+        totalWallet: money(walletRows[0]?.total),
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 module.exports = router;
